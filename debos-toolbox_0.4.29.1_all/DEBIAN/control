@@ -1,0 +1,10 @@
+Package: debos-toolbox
+Version: 0.4.29.1
+Section: admin
+Priority: optional
+Architecture: all
+Depends: python3, python3-tk, python3-pil, python3-pil.imagetk, fdupes, flatpak, curl, wget, gpg, dirmngr, aptitude, apt-transport-https, lsb-release, git, pciutils, extrepo, libnotify-bin, macchanger, speedtest-cli, net-tools, network-manager
+Maintainer: Hugo Moniz do Rego <hugomonizdorego@gmail.com>
+Description: Advanced System Cleaner, Software, Driver, Network and Kernel Installer.
+ Developed in Timor-Leste. License: OpenSource, GNU/Linux, FDSL - TL.
+ Built with the assistance of Google Gemini and Microsoft Copilot.

@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+import os, sys, subprocess, tempfile, threading, urllib.parse, webbrowser
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+try:
+    from PIL import Image, ImageTk
+except ImportError: pass
+
+def check_os_compatibility():
+    try:
+        with open("/etc/os-release") as f:
+            c = f.read().lower()
+            if "sid" in c or "unstable" in c:
+                t = tk.Tk(); t.withdraw()
+                messagebox.showerror("Unsupported OS", "Debos is for Debian Stable/Testing & LTS.")
+                sys.exit(1)
+    except: pass
+
+check_os_compatibility()
+
+def check_system_health():
+    try:
+        res = subprocess.run(['dpkg', '--audit'], capture_output=True, text=True)
+        if res.stdout.strip(): subprocess.run(['notify-send', '-u', 'critical', '-i', '/usr/share/pixmaps/debos-toolbox.png', 'Debos - Toolbox', 'Broken packages detected. Open Debos to fix.'])
+    except: pass
+
+if "--startup" in sys.argv: check_system_health(); sys.exit(0)
+
+LANGUAGES = {
+    "English": {"clean":"Clean System", "repo":"Fix Repo & GPG", "kernels":"Install Kernels", "manual":"Uninstall Kernel", "install_sw":"Install Software", "uninstall_sw":"Uninstall Software", "drivers":"Drivers & Hardware", "network":"Network Config", "customizer":"Customizer", "sources":"Edit Sources", "about":"About & Feedback", "license":"License"},
+    "Indonesia": {"clean":"Bersihkan Sistem", "repo":"Perbaiki Repo", "kernels":"Instal Kernel", "manual":"Copot Kernel", "install_sw":"Instal Aplikasi", "uninstall_sw":"Copot Aplikasi", "drivers":"Driver & Hardware", "network":"Konfigurasi Jaringan", "customizer":"Kustomisasi UI", "sources":"Edit Sources", "about":"Tentang & Masukan", "license":"Lisensi"},
+    "Portuguese": {"clean":"Limpar Sistema", "repo":"Corrigir Repo", "kernels":"Instalar Kernels", "manual":"Desinstalar Kernel", "install_sw":"Instalar Software", "uninstall_sw":"Desinstalar Software", "drivers":"Controladores", "network":"Configuração de Rede", "customizer":"Personalizador", "sources":"Editar Fontes", "about":"Sobre", "license":"Licença"}
+}
+
+KERNELS_LIST = [
+    ("linux-xanmod-x64v1", "⚙️ XanMod MAIN (v1)", "For older CPUs (AMD K8, Intel Core 2)."),
+    ("linux-xanmod-x64v2", "⚙️ XanMod MAIN (v2)", "For CPUs ~2009-2013 (Nehalem, Bulldozer)."),
+    ("linux-xanmod-x64v3", "⚙️ XanMod MAIN (v3)", "For modern CPUs (Haswell+, Zen)."),
+    ("linux-xanmod-x64v4", "⚙️ XanMod MAIN (v4)", "For AVX-512 CPUs (Skylake-X, Zen 4)."),
+    ("linux-xanmod-lts-x64v3", "🛡️ XanMod LTS (v3)", "Long Term Support version for modern CPUs."),
+    ("liquorix", "🎮 Liquorix Kernel", "Optimized for desktop, multimedia, & gaming."),
+    ("linux-libre", "🕊️ Linux-Libre (Main)", "100% Free Software kernel."),
+    ("mainline_stable", "🐧 Linux Mainline (Stable)", "Auto-compile stable kernel from kernel.org"),
+    ("mainline_longterm", "🛡️ Linux Mainline (Longterm)", "Auto-compile longterm kernel from kernel.org")
+]
+
+DE_COMMANDS = {
+    "GNOME": {"desc": "Modern and intuitive.", "full": "task-gnome-desktop", "minimal": "gnome-core", "core": "gnome-session gdm3", "rm": "^gnome|^gdm|^task-gnome"},
+    "KDE Plasma": {"desc": "Highly customizable desktop.", "full": "task-kde-desktop", "minimal": "plasma-desktop", "core": "plasma-desktop sddm", "rm": "^kde|^plasma|^sddm|^kdelibs"},
+    "XFCE": {"desc": "Fast and resource-friendly.", "full": "task-xfce-desktop", "minimal": "xfce4", "core": "xfce4-session lightdm", "rm": "^xfce|^thunar"},
+    "LXDE": {"desc": "Extremely fast desktop.", "full": "task-lxde-desktop", "minimal": "lxde-core", "core": "lxsession lightdm", "rm": "^lxde|^lxsession"},
+    "LXQt": {"desc": "Lightweight Qt environment.", "full": "task-lxqt-desktop", "minimal": "lxqt-core", "core": "lxqt-session sddm", "rm": "^lxqt|^pcmanfm-qt"},
+    "Cinnamon": {"desc": "Traditional, elegant desktop.", "full": "task-cinnamon-desktop", "minimal": "cinnamon", "core": "cinnamon-session lightdm", "rm": "^cinnamon|^nemo|^muffin"},
+    "MATE": {"desc": "Classic GNOME 2 fork.", "full": "task-mate-desktop", "minimal": "mate-desktop-environment-core", "core": "mate-session-manager lightdm", "rm": "^mate|^caja|^libmate"},
+    "Budgie": {"desc": "Sleek, modern desktop.", "full": "budgie-desktop-environment", "minimal": "budgie-desktop", "core": "budgie-desktop lightdm", "rm": "^budgie"}
+}
+
+WM_COMMANDS = {
+    "bspwm": {"pkg": "bspwm sxhkd xinit pcmanfm xterm papirus-icon-theme", "rm": "^bspwm|^sxhkd"},
+    "qtile": {"pkg": "python3-pip python3-venv xinit pcmanfm xterm papirus-icon-theme && python3 -m pip install xcffib qtile", "rm": "^qtile|^xcffib"},
+    "i3": {"pkg": "i3 xinit pcmanfm xterm papirus-icon-theme", "rm": "^i3$|^i3-wm"},
+    "jwm": {"pkg": "jwm xinit pcmanfm xterm papirus-icon-theme wget && wget -qO /usr/local/bin/mjwm https://raw.githubusercontent.com/chiku/mjwm/master/mjwm && chmod +x /usr/local/bin/mjwm", "rm": "^jwm"}
+}
+
+DEB_SOFTWARE = sorted([
+    ("docker", "🐳", "Docker CE", "Container platform."), ("chrome", "🌐", "Google Chrome", "Fast web browser."),
+    ("edge", "🌐", "Microsoft Edge", "AI browser."), ("brave", "🦁", "Brave Browser", "Privacy browser."),
+    ("firefox", "🦊", "Mozilla Firefox", "Open-source browser."), ("floorp", "🌍", "Floorp Browser", "Firefox fork."),
+    ("chromium", "🌐", "Chromium", "Chrome base."), ("opera", "🔴", "Opera Browser", "Browser with VPN."),
+    ("operagx", "🎮", "Opera GX", "Gaming browser."), ("vivaldi", "🔴", "Vivaldi", "Custom browser."),
+    ("librewolf", "🐺", "LibreWolf", "Privacy Firefox fork."), ("codecs", "⚙️", "Multimedia Codecs", "A/V codecs."),
+    ("vlc", "▶️", "VLC Player", "Media player."), ("audacious", "🎵", "Audacious", "Audio player."),
+    ("smplayer", "🎬", "SMPlayer", "Media player."), ("celluloid", "🎞️", "Celluloid", "GTK+ mpv."),
+    ("rhythmbox", "🎶", "Rhythmbox", "Music manager."), ("spotify", "🎧", "Spotify", "Music streaming."),
+    ("openshot", "✂️", "OpenShot", "Video editor."), ("obs", "🎥", "OBS Studio", "Live streaming."),
+    ("gimp", "🖌️", "GIMP", "Image editor."), ("inkscape", "✒️", "Inkscape", "Vector graphics."),
+    ("krita", "🎨", "Krita", "Painting program."), ("blender", "🧊", "Blender", "3D creation."),
+    ("onlyoffice", "📊", "OnlyOffice", "Secure office suite."), ("thunderbird", "📧", "Thunderbird", "Email app."),
+    ("googleearth", "🌎", "Google Earth Pro", "3D Earth."), ("ufw", "🧱", "UFW & Gufw", "Firewall GUI."),
+    ("clamtk", "🦠", "ClamTk Antivirus", "ClamAV frontend."), ("remmina", "🖥️", "Remmina", "Remote desktop."),
+    ("vscode", "💻", "VS Code", "Code editor."), ("vscodium", "💻", "VSCodium", "Telemetry-free VS Code."),
+    ("virtualbox", "💽", "VirtualBox", "Virtualization."), ("gparted", "🗄️", "GParted", "Partition editor."),
+    ("transmission", "⬇️", "Transmission", "BitTorrent."), ("qbittorrent", "⬇️", "qBittorrent", "BitTorrent client."),
+    ("steam", "🚂", "Steam", "Gaming platform."), ("wine", "🍷", "WineHQ", "Run Windows apps.")
+], key=lambda x: x[2])
+
+FLATPAK_SOFTWARE = sorted([
+    ("com.docker.docker", "🐳", "Docker Desktop", "Docker GUI."), ("org.videolan.VLC", "▶️", "VLC Player", "Media player."),
+    ("com.spotify.Client", "🎧", "Spotify", "Music streaming."), ("com.obsproject.Studio", "🎥", "OBS Studio", "Live streaming."),
+    ("org.blender.Blender", "🧊", "Blender", "3D creation."), ("org.gimp.GIMP", "🖌️", "GIMP", "Image editor."),
+    ("org.libreoffice.LibreOffice", "📝", "LibreOffice", "Office suite."), ("org.onlyoffice.desktopeditors", "📊", "OnlyOffice", "Office suite."),
+    ("org.telegram.desktop", "💬", "Telegram", "Messaging."), ("com.discordapp.Discord", "🎮", "Discord", "Voice & chat."),
+    ("com.valvesoftware.Steam", "🚂", "Steam", "Gaming."), ("com.visualstudio.code", "💻", "VS Code", "Code editor."),
+    ("ro.go.hmlendea.DL-Desktop", "🦉", "Duolingo Desktop", "Language app."), ("app.drey.Dialect", "🗣️", "Dialect", "Translation app."),
+    ("com.github.hugolabe.Wike", "📖", "Wike", "Wikipedia reader."), ("app.zen_browser.zen", "🦊", "Zen Browser", "Privacy browser."),
+    ("net.waterfox.waterfox", "🦊", "Waterfox", "Firefox fork."), ("io.github.ungoogled_software.ungoogled_chromium", "🌐", "Ungoogled Chromium", "Chromium base.")
+], key=lambda x: x[2])
+
+class DebosToolboxApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Debos - Toolbox v0.4.29.1")
+        self.root.geometry("1150x800")
+        self.SIDEBAR_BG, self.SIDEBAR_FG, self.SIDEBAR_HOVER, self.SIDEBAR_ACTIVE, self.CONTENT_BG = "#1A252F", "#ECF0F1", "#2C3E50", "#3498DB", "#FFFFFF"
+        self.root.configure(bg=self.CONTENT_BG)
+        
+        style = ttk.Style()
+        if 'clam' in style.theme_names(): style.theme_use('clam')
+        style.configure('TFrame', background=self.CONTENT_BG)
+        style.configure('TCheckbutton', background=self.CONTENT_BG, font=('Segoe UI', 10))
+        style.configure('App.TCheckbutton', background=self.CONTENT_BG, font=('Segoe UI', 11, 'bold'), foreground="#2C3E50")
+        style.configure('TRadiobutton', background=self.CONTENT_BG, font=('Segoe UI', 10, 'bold'), foreground="#2C3E50")
+        style.configure('TLabel', background=self.CONTENT_BG, font=('Segoe UI', 10))
+        style.configure('Header.TLabel', background=self.CONTENT_BG, font=('Segoe UI', 18, 'bold'), foreground='#2C3E50')
+        style.configure('Action.TButton', font=('Segoe UI', 10, 'bold'), padding=10, background='#3498DB', foreground='white')
+        style.configure('Danger.TButton', font=('Segoe UI', 10, 'bold'), padding=10, background='#E74C3C', foreground='white')
+
+        self.current_lang = tk.StringVar(value="English")
+        tf = tk.Frame(self.root, bg="#ECF0F1", height=70); tf.pack(side="top", fill="x")
+        tk.Label(tf, text="Debos - Toolbox", bg="#ECF0F1", font=('Segoe UI', 20, 'bold'), fg="#2C3E50").pack(side="left", padx=25, pady=10)
+        self.lang_menu = ttk.Combobox(tf, textvariable=self.current_lang, values=list(LANGUAGES.keys()), state="readonly", width=15)
+        self.lang_menu.pack(side='right', padx=25, pady=15); self.lang_menu.bind("<<ComboboxSelected>>", self.update_texts)
+
+        mc = tk.Frame(self.root, bg=self.CONTENT_BG); mc.pack(fill="both", expand=True)
+        self.sidebar = tk.Frame(mc, bg=self.SIDEBAR_BG, width=250); self.sidebar.pack(side="left", fill="y"); self.sidebar.pack_propagate(False)
+        self.content_area = tk.Frame(mc, bg=self.CONTENT_BG); self.content_area.pack(side="right", fill="both", expand=True, padx=30, pady=30)
+
+        self.pages, self.nav_buttons = {}, {}
+        self.create_pages(); self.create_sidebar_buttons(); self.show_page("clean")
+
+    def create_sidebar_buttons(self):
+        btns = [("clean", "Clean System"), ("repo", "Fix Repo & GPG"), ("kernels", "Install Kernels"), ("manual", "Uninstall Kernel"), ("install_sw", "Install Software"), ("uninstall_sw", "Uninstall Software"), ("drivers", "Drivers & Hardware"), ("network", "Network Config"), ("customizer", "Customizer"), ("sources", "Edit Sources"), ("about", "About & Feedback"), ("license", "License")]
+        for key, txt in btns:
+            b = tk.Button(self.sidebar, text=f"  {txt}", bg=self.SIDEBAR_BG, fg=self.SIDEBAR_FG, font=('Segoe UI', 11), bd=0, anchor="w", padx=20, pady=12, activebackground=self.SIDEBAR_HOVER, command=lambda k=key: self.show_page(k))
+            b.pack(fill="x"); self.nav_buttons[key] = b
+
+    def show_page(self, page_key):
+        for k, b in self.nav_buttons.items(): b.config(bg=self.SIDEBAR_ACTIVE if k == page_key else self.SIDEBAR_BG)
+        for f in self.pages.values(): f.pack_forget()
+        self.pages[page_key].pack(fill="both", expand=True)
+        if page_key == "manual": self.refresh_kernel_list()
+        elif page_key == "uninstall_sw": self.refresh_software_list()
+        elif page_key == "network": self.refresh_interfaces()
+
+    def update_texts(self, e=None):
+        lang = LANGUAGES.get(self.current_lang.get(), LANGUAGES["English"])
+        for k, b in self.nav_buttons.items(): b.config(text=f"  {lang.get(k, k)}")
+
+    def create_scroll_area(self, parent):
+        c = tk.Canvas(parent, bg=self.CONTENT_BG, highlightthickness=0); s = ttk.Scrollbar(parent, orient="vertical", command=c.yview)
+        f = tk.Frame(c, bg=self.CONTENT_BG)
+        f.bind("<Configure>", lambda e: c.configure(scrollregion=c.bbox("all")))
+        c.create_window((0, 0), window=f, anchor="nw"); c.configure(yscrollcommand=s.set)
+        c.pack(side="left", fill="both", expand=True); s.pack(side="right", fill="y")
+        c.bind('<Enter>', lambda e: c.bind_all("<Button-4>", lambda e: c.yview_scroll(-1, "units")) or c.bind_all("<Button-5>", lambda e: c.yview_scroll(1, "units")))
+        c.bind('<Leave>', lambda e: c.unbind_all("<Button-4>") or c.unbind_all("<Button-5>"))
+        return f
+
+    def execute_in_terminal(self, cmds, pause=True):
+        scr = "#!/bin/bash\ncd /tmp || exit\n" + "\n".join(cmds)
+        scr += "\necho -e '\\n\\e[1;32m[+] Process Finished!\\e[0m'; read -p 'Press Enter...'\n" if pause else "\nsleep 2\n"
+        fd, path = tempfile.mkstemp(suffix=".sh")
+        os.write(fd, scr.encode('utf-8')); os.close(fd); os.chmod(path, 0o755)
+        subprocess.Popen(['x-terminal-emulator', '-e', 'sudo', 'bash', path])
+
+    def create_pages(self):
+        self.setup_clean_page(); self.setup_repo_page(); self.setup_kernel_page(); self.setup_manual_page()
+        self.setup_install_sw_page(); self.setup_uninstall_sw_page(); self.setup_drivers_page()
+        self.setup_network_page(); self.setup_customizer_page(); self.setup_sources_page()
+        self.setup_about_page(); self.setup_license_page()
+
+    def setup_clean_page(self):
+        f = ttk.Frame(self.content_area); self.pages["clean"] = f
+        ttk.Label(f, text="System Cleaning", style='Header.TLabel').pack(anchor="w", pady=(0, 20))
+        self.cl_vars = {k: tk.BooleanVar(value=True) for k in ["old_kernels", "update_grub", "apt_cache", "rc_configs", "flatpak"]}
+        self.cl_vars.update({"empty_folders": tk.BooleanVar(value=False), "duplicates": tk.BooleanVar(value=False)})
+        opts = [("old_kernels", "Remove Old Kernels"), ("update_grub", "Update GRUB"), ("apt_cache", "Remove Cache"), ("rc_configs", "Remove Residual Configs"), ("flatpak", "Remove Unused Flatpak"), ("empty_folders", "Remove Empty Folders (/tmp)"), ("duplicates", "Remove Duplicates (/tmp)")]
+        sa = self.create_scroll_area(f)
+        for k, t in opts: ttk.Checkbutton(sa, text=t, variable=self.cl_vars[k]).pack(anchor="w", pady=6, padx=10)
+        ttk.Button(f, text="Execute Cleaning", style='Action.TButton', command=self.run_cleaning).pack(pady=10, anchor="w")
+
+    def run_cleaning(self):
+        cmds = ["cd /tmp || exit"]
+        if self.cl_vars["old_kernels"].get(): cmds.append("apt-get autoremove --purge -y")
+        if self.cl_vars["update_grub"].get(): cmds.append("update-grub")
+        if self.cl_vars["apt_cache"].get(): cmds.extend(["apt-get clean -y", "apt-get autoclean -y", "journalctl --vacuum-time=3d"])
+        if self.cl_vars["rc_configs"].get(): cmds.append("dpkg -l | grep '^rc' | awk '{print $2}' | xargs -r dpkg --purge")
+        if self.cl_vars["flatpak"].get(): cmds.append("flatpak uninstall --unused -y")
+        if self.cl_vars["empty_folders"].get(): cmds.extend(["find ~/.cache /tmp -type d -empty -delete 2>/dev/null || true"])
+        if self.cl_vars["duplicates"].get(): cmds.append("fdupes -rdN /tmp || true")
+        if len(cmds) > 1: self.execute_in_terminal(cmds)
+
+    def setup_repo_page(self):
+        f = ttk.Frame(self.content_area); self.pages["repo"] = f
+        ttk.Label(f, text="Fix Broken Repositories", style='Header.TLabel').pack(anchor="w", pady=(0, 20))
+        ttk.Button(f, text="Fix APT & GPG Errors", style='Action.TButton', command=self.run_repo_fix).pack(pady=20, anchor="w")
+
+    def run_repo_fix(self):
+        cmds = [
+            "echo -e '\\e[1;34m[*] Step 1: Global Repository Deduplication...\\e[0m'",
+            "for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do [ -f \"$f\" ] && awk '!seen[$0]++' \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; done",
+            "mkdir -p /etc/apt/apt.conf.d; echo 'Acquire::AllowWeakSignatures \"true\";' > /etc/apt/apt.conf.d/99-allow-weak-signatures",
+            "echo -e '\\n\\e[1;34m[*] Step 2: Auto-fetching missing PUBKEYs from APT logs...\\e[0m'",
+            "apt-get update 2> /tmp/apt-errors.log || true",
+            "MISSING_KEYS=$(grep -oP 'NO_PUBKEY \\K[0-9A-F]+' /tmp/apt-errors.log | sort | uniq || true)",
+            "for key in $MISSING_KEYS; do gpg --keyserver keyserver.ubuntu.com --recv-keys \"$key\" || true; gpg --export \"$key\" > /etc/apt/trusted.gpg.d/${key}.gpg || true; done",
+            "dpkg --configure -a; apt-get --fix-broken install -y; apt-get update"
+        ]
+        self.execute_in_terminal(cmds)
+
+    def setup_kernel_page(self):
+        f = ttk.Frame(self.content_area); self.pages["kernels"] = f
+        ttk.Label(f, text="Install Custom Kernels", style='Header.TLabel').pack(anchor="w", pady=10)
+        sa = self.create_scroll_area(f); self.kernel_vars = {}
+        for c, n, d in KERNELS_LIST:
+            v = tk.BooleanVar(); self.kernel_vars[c] = v
+            ttk.Checkbutton(sa, text=n, variable=v, style='App.TCheckbutton').pack(anchor="w", pady=(5, 0), padx=10)
+            tk.Label(sa, text=d, bg=self.CONTENT_BG, fg="#7F8C8D", font=('Segoe UI', 9)).pack(anchor="w", padx=38, pady=(0, 5))
+        ttk.Button(f, text="Install Selected Kernels", style='Action.TButton', command=self.install_kernel).pack(anchor="w", pady=10)
+
+    def install_kernel(self):
+        cmds = ["apt-get update"]
+        sel = [c for c, v in self.kernel_vars.items() if v.get()]
+        if not sel: return messagebox.showinfo("Info", "No kernel selected.")
+        
+        if "mainline_stable" in sel or "mainline_longterm" in sel:
+            cmds.extend(["apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc wget tar"])
+            if "mainline_stable" in sel: cmds.extend(["VER=$(curl -s https://www.kernel.org/ | grep -A 1 'stable:' | grep -oP '(?<=<strong>).*?(?=</strong>)' | head -n1)", "wget -qO /tmp/linux-$VER.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$VER.tar.xz", "tar -xf /tmp/linux-$VER.tar.xz -C /tmp && cd /tmp/linux-$VER", "cp /boot/config-$(uname -r) .config", "make olddefconfig && make -j$(nproc) && make modules_install && make install"])
+            if "mainline_longterm" in sel: cmds.extend(["VER=$(curl -s https://www.kernel.org/ | grep -A 1 'longterm:' | grep -oP '(?<=<strong>).*?(?=</strong>)' | head -n1)", "wget -qO /tmp/linux-$VER.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$VER.tar.xz", "tar -xf /tmp/linux-$VER.tar.xz -C /tmp && cd /tmp/linux-$VER", "cp /boot/config-$(uname -r) .config", "make olddefconfig && make -j$(nproc) && make modules_install && make install"])
+
+        if any("xanmod" in c for c in sel): cmds.extend(["wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg --yes", "echo 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $(lsb_release -sc) main non-free' > /etc/apt/sources.list.d/xanmod.list", "apt-get update"])
+        for c in sel:
+            if "liquorix" in c: cmds.append("curl -s 'https://liquorix.net/install-liquorix.sh' | bash")
+            elif "libre" in c: cmds.extend(["wget -O /tmp/freesh.deb https://linux-libre.fsfla.org/pub/linux-libre/freesh/pool/main/f/freesh-archive-keyring/freesh-archive-keyring_1.3_all.deb", "dpkg -i /tmp/freesh.deb", "apt-get update", "apt-get install -y linux-libre"])
+            elif "mainline" not in c: cmds.append(f"apt-get install -y {c}")
+        self.execute_in_terminal(cmds)
+
+    def setup_manual_page(self):
+        f = ttk.Frame(self.content_area); self.pages["manual"] = f
+        ttk.Label(f, text="Uninstall Kernel", style='Header.TLabel').pack(anchor="w")
+        self.lbl_curr = ttk.Label(f, text="Current: Loading...", font=('Segoe UI', 11, 'bold'), foreground="#27ae60"); self.lbl_curr.pack(anchor="w", pady=10)
+        self.scroll_k_del = self.create_scroll_area(f); self.k_del_vars = {}
+        bf = tk.Frame(f, bg=self.CONTENT_BG); bf.pack(anchor="w", pady=15)
+        ttk.Button(bf, text="Refresh List", command=self.refresh_kernel_list).pack(side="left", padx=(0, 15))
+        ttk.Button(bf, text="Remove Selected", style='Danger.TButton', command=self.remove_manual_kernel).pack(side="left")
+
+    def refresh_kernel_list(self):
+        try:
+            curr = subprocess.run(['uname', '-r'], capture_output=True, text=True).stdout.strip(); self.lbl_curr.config(text=f"Currently running: {curr}")
+            res = subprocess.run("dpkg-query -W -f='${Package}\\n' | grep -E '^linux-image'", shell=True, capture_output=True, text=True).stdout.strip().split('\n')
+            safes = [k for k in res if k and curr not in k and "linux-image" in k]
+            for w in self.scroll_k_del.winfo_children(): w.destroy()
+            self.k_del_vars.clear()
+            for k in safes:
+                v = tk.BooleanVar(); self.k_del_vars[k] = v
+                ttk.Checkbutton(self.scroll_k_del, text=f"🗑️ {k}", variable=v).pack(anchor="w", pady=5, padx=10)
+        except: pass
+
+    def remove_manual_kernel(self):
+        to_rem = [k for k, v in self.k_del_vars.items() if v.get()]
+        if to_rem and messagebox.askyesno("Confirm", f"Remove {len(to_rem)} kernels?"): self.execute_in_terminal([f"apt-get purge -y {' '.join(to_rem)}", "apt-get autoremove --purge -y", "update-grub"])
+
+    def setup_install_sw_page(self):
+        f = ttk.Frame(self.content_area); self.pages["install_sw"] = f
+        ttk.Label(f, text="Install Software & Desktop Environments", style='Header.TLabel').pack(anchor="w", pady=(0, 10))
+        nb = ttk.Notebook(f); nb.pack(fill='both', expand=True, pady=10)
+        
+        t1 = ttk.Frame(nb); t2 = ttk.Frame(nb); t3 = ttk.Frame(nb); t4 = ttk.Frame(nb)
+        nb.add(t1, text="DEB Packages"); nb.add(t2, text="Flatpaks"); nb.add(t3, text="Desktop Envs"); nb.add(t4, text="Window Managers")
+        
+        self.deb_vars = {}; sd = self.create_scroll_area(t1)
+        for c, i, n, d in DEB_SOFTWARE:
+            v = tk.BooleanVar(); self.deb_vars[c] = v
+            ttk.Checkbutton(sd, text=f"{i}  {n}", variable=v, style='App.TCheckbutton').pack(anchor="w", pady=(10, 0), padx=10)
+            tk.Label(sd, text=d, bg=self.CONTENT_BG, fg="#7F8C8D", font=('Segoe UI', 9)).pack(anchor="w", padx=38, pady=(0, 5))
+
+        self.fp_vars = {}; sf = self.create_scroll_area(t2)
+        for c, i, n, d in FLATPAK_SOFTWARE:
+            v = tk.BooleanVar(); self.fp_vars[c] = v
+            ttk.Checkbutton(sf, text=f"{i}  {n}", variable=v, style='App.TCheckbutton').pack(anchor="w", pady=(10, 0), padx=10)
+            tk.Label(sf, text=d, bg=self.CONTENT_BG, fg="#7F8C8D", font=('Segoe UI', 9)).pack(anchor="w", padx=38, pady=(0, 5))
+
+        self.de_vars = {}; sde = self.create_scroll_area(t3)
+        for n, cfg in DE_COMMANDS.items():
+            dc = tk.Frame(sde, bg=self.CONTENT_BG); dc.pack(fill="x", pady=5, padx=10)
+            tk.Label(dc, text=f"🖥️ {n}", font=('Segoe UI', 11, 'bold'), bg=self.CONTENT_BG, fg="#2C3E50").pack(anchor="w")
+            v = tk.StringVar(value="none"); self.de_vars[n] = v
+            of = tk.Frame(dc, bg=self.CONTENT_BG); of.pack(anchor="w", padx=25, pady=0)
+            for txt, val in [("None", "none"), ("Full", "full"), ("Minimal", "minimal"), ("Core", "core"), ("Remove", "remove")]: ttk.Radiobutton(of, text=txt, variable=v, value=val).pack(side="left", padx=5)
+
+        self.wm_vars = {}; swm = self.create_scroll_area(t4)
+        for n, cfg in WM_COMMANDS.items():
+            wc = tk.Frame(swm, bg=self.CONTENT_BG); wc.pack(fill="x", pady=5, padx=10)
+            tk.Label(wc, text=f"🪟 {n.upper()}", font=('Segoe UI', 11, 'bold'), bg=self.CONTENT_BG, fg="#2C3E50").pack(anchor="w")
+            v = tk.StringVar(value="none"); self.wm_vars[n] = v
+            of = tk.Frame(wc, bg=self.CONTENT_BG); of.pack(anchor="w", padx=25, pady=0)
+            for txt, val in [("None", "none"), ("Install", "install"), ("Remove", "remove")]: ttk.Radiobutton(of, text=txt, variable=v, value=val).pack(side="left", padx=5)
+
+        ttk.Button(f, text="Apply Changes", style='Action.TButton', command=self.install_sw).pack(anchor="w", pady=10)
+
+    def install_sw(self):
+        cmds = ["cd /tmp || exit", "apt-get update"]
+        debs = [c for c, v in self.deb_vars.items() if v.get() and c not in ["docker", "chrome", "edge", "brave", "firefox", "opera", "operagx", "onlyoffice"]]
+        if debs: cmds.append(f"apt-get install -y {' '.join(debs)}")
+        
+        for c, v in self.deb_vars.items():
+            if v.get() and c == "docker": cmds.extend(["apt-get remove -y docker.io docker-doc docker-compose podman-docker containerd runc", "apt-get update", "apt-get install -y ca-certificates curl gnupg", "install -m 0755 -d /etc/apt/keyrings", "curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes", "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo \\\"$VERSION_CODENAME\\\") stable\" | tee /etc/apt/sources.list.d/docker.list > /dev/null", "apt-get update", "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"])
+            elif v.get() and c == "chrome": cmds.extend(["wget -qO /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb", "dpkg -i /tmp/chrome.deb", "apt-get -f install -y"])
+            elif v.get() and c == "edge": cmds.extend(["apt-get install -y ca-certificates curl gnupg", "curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /etc/apt/keyrings/microsoft.gpg", "chmod a+r /etc/apt/keyrings/microsoft.gpg", "echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main' > /etc/apt/sources.list.d/microsoft-edge.list", "apt-get update", "apt-get install -y microsoft-edge-stable"])
+            elif v.get() and c == "brave": cmds.append("curl -fsS https://dl.brave.com/install.sh | sh")
+            elif v.get() and c == "firefox": cmds.extend(["install -d -m 0755 /etc/apt/keyrings", "wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- | tee /etc/apt/keyrings/packages.mozilla.org.asc > /dev/null", "echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' > /etc/apt/sources.list.d/mozilla.list", "apt-get update", "apt-get install -y firefox"])
+            elif v.get() and c == "opera": cmds.extend(["wget -qO- https://deb.opera.com/archive.key | gpg --dearmor | dd of=/usr/share/keyrings/opera-browser.gpg", "echo 'deb [signed-by=/usr/share/keyrings/opera-browser.gpg] https://deb.opera.com/opera-stable/ stable non-free' > /etc/apt/sources.list.d/opera-archive.list", "apt-get update", "apt-get install -y opera-stable"])
+            elif v.get() and c == "operagx": cmds.extend(["wget -qO- https://deb.opera.com/archive.key | gpg --dearmor | dd of=/usr/share/keyrings/opera-browser.gpg", "echo 'deb [signed-by=/usr/share/keyrings/opera-browser.gpg] https://deb.opera.com/opera-gx-stable/ stable non-free' > /etc/apt/sources.list.d/opera-archive.list", "apt-get update", "apt-get install -y opera-gx-stable"])
+            elif v.get() and c == "onlyoffice": cmds.extend(["mkdir -p -m 700 ~/.gnupg", "gpg --no-default-keyring --keyring gnupg-ring:/tmp/onlyoffice.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys CB2DE8E5", "chmod 644 /tmp/onlyoffice.gpg", "chown root:root /tmp/onlyoffice.gpg", "mv /tmp/onlyoffice.gpg /usr/share/keyrings/onlyoffice.gpg", "echo 'deb [signed-by=/usr/share/keyrings/onlyoffice.gpg] https://download.onlyoffice.com/repo/debian squeeze main' > /etc/apt/sources.list.d/onlyoffice.list", "apt-get update", "apt-get install -y onlyoffice-desktopeditors"])
+
+        fpaks = [c for c, v in self.fp_vars.items() if v.get()]
+        if fpaks: cmds.extend(["apt-get install -y flatpak", "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo", f"flatpak install -y flathub {' '.join(fpaks)}"])
+
+        de_act = False
+        for n, v in self.de_vars.items():
+            act = v.get()
+            if act in ["full", "minimal", "core"]: cmds.extend([f"apt-get install -y {DE_COMMANDS[n][act]}", "systemctl set-default graphical.target"]); de_act = True
+            elif act == "remove": cmds.extend([f"dpkg -l | awk '/^ii/ && ($2 ~ /{DE_COMMANDS[n]['rm_regex']}/){{print $2}}' | xargs -r apt-get purge -y", "apt-get autoremove -y"]); de_act = True
+
+        for n, v in self.wm_vars.items():
+            act = v.get()
+            if act == "install":
+                cmds.extend([WM_COMMANDS[n]["install"], "mkdir -p ~/.config", "apt-get install -y papirus-icon-theme", "update-alternatives --set x-cursor-theme /usr/share/icons/Papirus || true"])
+                de_act = True
+            elif act == "remove": cmds.extend([f"dpkg -l | awk '/^ii/ && ($2 ~ /{WM_COMMANDS[n]['rm_regex']}/){{print $2}}' | xargs -r apt-get purge -y", "apt-get autoremove -y"]); de_act = True
+
+        if len(cmds) > 2 or de_act: self.execute_in_terminal(cmds)
+        else: messagebox.showinfo("Info", "No actions selected.")
+
+    def setup_uninstall_sw_page(self):
+        f = ttk.Frame(self.content_area); self.pages["uninstall_sw"] = f
+        ttk.Label(f, text="Uninstall System Software", style='Header.TLabel').pack(anchor="w", pady=(0, 10))
+        self.scroll_u_frame = self.create_scroll_area(f); self.u_vars = {}
+        bf = tk.Frame(f, bg=self.CONTENT_BG); bf.pack(anchor="w", pady=10)
+        self.btn_ref_sw = ttk.Button(bf, text="Refresh Installed List", command=self.refresh_software_list); self.btn_ref_sw.pack(side="left", padx=5)
+        self.btn_un_sw = ttk.Button(bf, text="Uninstall Selected", style='Danger.TButton', command=self.uninstall_software); self.btn_un_sw.pack(side="left")
+
+    def fetch_software_list(self):
+        try:
+            res = subprocess.run("find /usr/share/applications ~/.local/share/applications /var/lib/flatpak/app -name '*.desktop' -exec grep -H '^Exec=' {} \\; | awk -F'=' '{print $2}' | awk '{print $1}' | rev | cut -d'/' -f1 | rev | sort -u", shell=True, capture_output=True, text=True).stdout.strip().split('\n')
+            pkgs = set()
+            for b in res:
+                if b and not b.startswith("%"):
+                    if b.startswith("com.") or b.startswith("org."): pkgs.add(f"flatpak:{b}")
+                    else:
+                        p = subprocess.run(f"dpkg -S $(which {b} 2>/dev/null) 2>/dev/null | cut -d':' -f1", shell=True, capture_output=True, text=True).stdout.strip()
+                        if p: pkgs.update(p.split('\n'))
+            bl = ["coreutils", "dpkg", "apt", "bash", "systemd", "dbus"]
+            self.root.after(0, self.update_sw_cb, sorted([p for p in pkgs if p not in bl]))
+        except: self.root.after(0, self.update_sw_cb, [])
+
+    def update_sw_cb(self, pkgs):
+        for w in self.scroll_u_frame.winfo_children(): w.destroy()
+        self.u_vars.clear()
+        if not pkgs: tk.Label(self.scroll_u_frame, text="No removable GUI apps found.", bg=self.CONTENT_BG).pack(anchor="w", pady=10, padx=10)
+        else:
+            for p in pkgs:
+                v = tk.BooleanVar(); self.u_vars[p] = v
+                ttk.Checkbutton(self.scroll_u_frame, text=f"🗑️ {p}", variable=v).pack(anchor="w", pady=2, padx=10)
+        self.btn_un_sw.config(state="normal"); self.btn_ref_sw.config(state="normal")
+
+    def refresh_software_list(self):
+        for w in self.scroll_u_frame.winfo_children(): w.destroy()
+        tk.Label(self.scroll_u_frame, text="Scanning installed software... Please wait.", bg=self.CONTENT_BG, font=('Segoe UI', 10, 'italic')).pack(anchor="w", pady=10, padx=10)
+        self.btn_un_sw.config(state="disabled"); self.btn_ref_sw.config(state="disabled")
+        threading.Thread(target=self.fetch_software_list, daemon=True).start()
+
+    def uninstall_software(self):
+        rem = [p for p, v in self.u_vars.items() if v.get()]
+        if not rem: return messagebox.showinfo("Info", "No software selected for removal.")
+        if messagebox.askyesno("Confirm", f"Remove {len(rem)} packages?"):
+            cmds = ["cd /tmp || exit"]
+            for p in rem:
+                if p.startswith("flatpak:"): cmds.append(f"flatpak uninstall -y {p.split(':')[1]}")
+                else: cmds.append(f"apt-get purge -y {p}")
+            cmds.extend(["apt-get autoremove -y", "apt-get clean"])
+            self.execute_in_terminal(cmds); self.refresh_software_list()
+
+    def setup_drivers_page(self):
+        f = ttk.Frame(self.content_area); self.pages["drivers"] = f
+        ttk.Label(f, text="Drivers & Hardware", style='Header.TLabel').pack(anchor="w", pady=(0, 10))
+        inf = tk.Frame(f, bg="#FFF", bd=1, relief="solid", padx=10, pady=10); inf.pack(fill='x', pady=10)
+        try:
+            g = subprocess.run("lspci | grep -iE 'vga|3d|display'", shell=True, capture_output=True, text=True).stdout.strip()
+            n = subprocess.run("lspci | grep -iE 'network|ethernet|wireless'", shell=True, capture_output=True, text=True).stdout.strip()
+            s = subprocess.run("lspci | grep -i audio", shell=True, capture_output=True, text=True).stdout.strip()
+            b = subprocess.run("lsusb | grep -i bluetooth", shell=True, capture_output=True, text=True).stdout.strip()
+            pci_info = f"GPU:\n{g}\n\nNetwork:\n{n}\n\nSound:\n{s}\n\nBluetooth:\n{b}"
+        except: pci_info = "Command 'lspci' not found."
+        tk.Label(inf, text="Detected Devices:", bg="#FFF", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        tk.Label(inf, text=pci_info, bg="#FFF", fg="#2980b9", justify="left").pack(anchor='w', pady=5)
+        
+        sa = self.create_scroll_area(f); self.drv_vars = {}
+        opts = [
+            ("nvidia", "Proprietary NVIDIA Driver (nvidia-driver, linux-headers)", "Proprietary"),
+            ("broadcom", "Proprietary Broadcom Network Driver (broadcom-sta-dkms)", "Proprietary"),
+            ("firmware", "Firmware Wireless Driver (Realtek, Intel Wi-Fi/BT, Atheros)", "Proprietary/Non-Free"),
+            ("amd", "AMD Open Source Drivers (firmware-amd-graphics, libgl1-mesa-dri)", "Open Source"),
+            ("intel", "Intel Arc / Integrated Open Source (mesa, va-driver)", "Open Source"),
+            ("nouveau", "Nouveau Display Driver (NVIDIA Open Source)", "Open Source")
+        ]
+        for c, t, cat in opts:
+            v = tk.BooleanVar(); self.drv_vars[c] = v
+            ttk.Checkbutton(sa, text=f"[{cat}] {t}", variable=v).pack(anchor="w", pady=5)
+        ttk.Button(f, text="Apply Drivers", style='Action.TButton', command=self.run_drv).pack(pady=10, anchor="w")
+
+    def run_drv(self):
+        sel = [c for c, v in self.drv_vars.items() if v.get()]
+        if not sel: return messagebox.showinfo("Info", "No driver changes selected.")
+        cmds = ["sed -i -e 's/ main$/ main contrib non-free non-free-firmware/' -e 's/ main contrib$/ main contrib non-free non-free-firmware/' /etc/apt/sources.list", "apt-get update"]
+        if "nvidia" in sel: cmds.append("apt-get install -y nvidia-driver linux-headers-$(uname -r)")
+        if "broadcom" in sel: cmds.append("apt-get install -y firmware-brcm80211 firmware-b43-installer firmware-b43legacy-installer broadcom-sta-dkms")
+        if "firmware" in sel: cmds.append("apt-get install -y firmware-linux firmware-linux-nonfree firmware-iwlwifi firmware-realtek firmware-atheros firmware-misc-nonfree")
+        if "amd" in sel: cmds.append("apt-get install -y firmware-amd-graphics libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers xserver-xorg-video-amdgpu")
+        if "intel" in sel: cmds.append("apt-get install -y mesa-utils libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers intel-media-va-driver-non-free firmware-misc-nonfree")
+        if "nouveau" in sel: cmds.extend(["apt-get purge -y nvidia-*", "apt-get install -y xserver-xorg-video-nouveau"])
+        self.execute_in_terminal(cmds)
+
+    def show_ip_addresses(self):
+        try:
+            loc = subprocess.run("ip -4 addr show | grep -v '127.0.0.1' | grep inet | awk '{print $2}'", shell=True, capture_output=True, text=True).stdout.strip()
+            pub = subprocess.run("curl -s ifconfig.me", shell=True, capture_output=True, text=True).stdout.strip()
+            messagebox.showinfo("IP Addresses", f"Local IP Address(es):\n{loc}\n\nPublic IP Address:\n{pub}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to retrieve IP addresses: {e}")
+
+    def test_wifi(self):
+        cmds = [
+            "echo -e '\\e[1;34m[*] Installing Wi-Fi audit tools & dependencies...\\e[0m'",
+            "apt-get update",
+            "apt-get install -y network-manager wpasupplicant wireless-tools iw rfkill nmap tcpdump",
+            "systemctl enable --now NetworkManager",
+            "rfkill unblock wifi",
+            "echo -e '\\e[1;32m[*] Wi-Fi tools active.\\e[0m'",
+            "echo -e '\\e[1;34m[*] Available Wi-Fi Networks:\\e[0m'",
+            "nmcli dev wifi list",
+            "echo -e '\\n\\e[1;34m[*] Scanning local subnet for active hosts...\\e[0m'",
+            "IFACE=$(ip route | grep default | grep -oP '(?<=dev )\\S+' | head -n1)",
+            "if [ -n \"$IFACE\" ]; then",
+            "  SUBNET=$(ip -4 addr show $IFACE | grep -oP '(?<=inet \\s)\\d+\\.\\d+\\.\\d+\\.0/24' || echo '')",
+            "  if [ -n \"$SUBNET\" ]; then nmap -sn $SUBNET; else echo 'Subnet not found.'; fi",
+            "else echo 'No active network interface found.'; fi"
+        ]
+        self.execute_in_terminal(cmds)
+
+    def setup_rdp_server(self):
+        cmds = [
+            "echo -e '\\e[1;34m[*] Setting up Remote Desktop (RDP) Server...\\e[0m'",
+            "apt-get update && apt-get install -y xfce4 xfce4-goodies xrdp ufw",
+            "echo 'xfce4-session' > /etc/skel/.xsession",
+            "systemctl enable xrdp && systemctl restart xrdp",
+            "ufw allow 3389/tcp",
+            "echo -e '\\n\\e[1;32m[+] RDP Server is Ready!\\e[0m'",
+            "echo 'Use an RDP Client (like Remmina or Windows Remote Desktop) to connect to your IP on port 3389.'"
+        ]
+        self.execute_in_terminal(cmds)
+
+    def setup_network_page(self):
+        f = ttk.Frame(self.content_area); self.pages["network"] = f
+        ttk.Label(f, text="Network Configuration", style='Header.TLabel').pack(anchor="w", pady=(0, 10))
+        sa = self.create_scroll_area(f)
+        
+        inf = tk.LabelFrame(sa, text="Network Info & Diagnostics", bg=self.CONTENT_BG); inf.pack(fill="x", padx=10, pady=10)
+        tk.Button(inf, text="Show Public & Local IP", command=self.show_ip_addresses).pack(side="left", padx=5, pady=10)
+        tk.Button(inf, text="Speedtest (Terminal)", command=lambda: self.execute_in_terminal(["speedtest-cli"])).pack(side="left", padx=5)
+        tk.Button(inf, text="Test Wi-Fi / Audit", command=self.test_wifi).pack(side="left", padx=5)
+
+        mgr = tk.LabelFrame(sa, text="Connection Management", bg=self.CONTENT_BG); mgr.pack(fill="x", padx=10, pady=10)
+        tk.Button(mgr, text="Open Network Manager (nmtui)", command=lambda: self.execute_in_terminal(["nmtui"])).pack(side="left", padx=5, pady=10)
+        tk.Button(mgr, text="Show Saved Wi-Fi Passwords", command=lambda: self.execute_in_terminal(["cat /etc/NetworkManager/system-connections/* | grep -E '^id=|^psk='"])).pack(side="left", padx=5)
+        tk.Button(mgr, text="Edit /etc/hosts", command=lambda: self.execute_in_terminal(["nano /etc/hosts"])).pack(side="left", padx=5)
+
+        rdp = tk.LabelFrame(sa, text="Remote Desktop", bg=self.CONTENT_BG); rdp.pack(fill="x", padx=10, pady=10)
+        tk.Button(rdp, text="Setup RDP Server (XFCE)", command=self.setup_rdp_server).pack(side="left", padx=5, pady=10)
+        tk.Button(rdp, text="Install RDP Client (Remmina)", command=lambda: self.execute_in_terminal(["apt-get update", "apt-get install -y remmina remmina-plugin-rdp"])).pack(side="left", padx=5)
+
+        mac = tk.LabelFrame(sa, text="MAC Address Changer (Spoofing)", bg=self.CONTENT_BG); mac.pack(fill="x", padx=10, pady=10)
+        tk.Label(mac, text="Select Interface:", bg=self.CONTENT_BG).pack(side="left", padx=5)
+        self.iface_var = tk.StringVar()
+        self.mac_cb = ttk.Combobox(mac, textvariable=self.iface_var, state="readonly", width=15)
+        self.mac_cb.pack(side="left", padx=5, pady=10)
+        tk.Button(mac, text="Randomize MAC", command=lambda: self.execute_in_terminal([f"ip link set dev {self.iface_var.get()} down", f"macchanger -r {self.iface_var.get()}", f"ip link set dev {self.iface_var.get()} up"]) if self.iface_var.get() else None).pack(side="left", padx=5)
+        tk.Button(mac, text="Restore Original MAC", command=lambda: self.execute_in_terminal([f"ip link set dev {self.iface_var.get()} down", f"macchanger -p {self.iface_var.get()}", f"ip link set dev {self.iface_var.get()} up"]) if self.iface_var.get() else None).pack(side="left", padx=5)
+        self.refresh_interfaces()
+
+    def refresh_interfaces(self):
+        try: self.mac_cb['values'] = [i for i in os.listdir('/sys/class/net') if i != 'lo']
+        except: pass
+
+    def get_users(self):
+        try: return subprocess.run("awk -F':' '{ if ($3 >= 1000 && $3 < 60000) print $1 }' /etc/passwd", shell=True, capture_output=True, text=True).stdout.strip().split('\n')
+        except: return []
+
+    def setup_customizer_page(self):
+        f = ttk.Frame(self.content_area); self.pages["customizer"] = f
+        ttk.Label(f, text="System Customizer (Boot & Login)", style='Header.TLabel').pack(anchor="w", pady=(0, 10))
+        sa = self.create_scroll_area(f)
+
+        # GRUB
+        gf = tk.LabelFrame(sa, text="GRUB Bootloader Customizer", bg=self.CONTENT_BG, font=('Segoe UI', 10, 'bold'), fg=self.SIDEBAR_BG)
+        gf.pack(fill="x", padx=10, pady=5)
+        gin = tk.Frame(gf, bg=self.CONTENT_BG); gin.pack(anchor="w", fill="x", padx=10, pady=10)
+        tk.Label(gin, text="Timeout (Seconds):", bg=self.CONTENT_BG).grid(row=0, column=0, sticky="w", pady=5)
+        self.g_to = tk.StringVar(value="5"); ttk.Entry(gin, textvariable=self.g_to, width=5).grid(row=0, column=1, sticky="w", padx=10)
+        self.g_hid = tk.BooleanVar(value=False); ttk.Checkbutton(gin, text="Hide GRUB menu", variable=self.g_hid).grid(row=1, column=0, columnspan=2, sticky="w")
+        self.g_osp = tk.BooleanVar(value=True); ttk.Checkbutton(gin, text="Enable OS Prober", variable=self.g_osp).grid(row=2, column=0, columnspan=2, sticky="w")
+        tk.Label(gin, text="Normal Color (Text/Bg):", bg=self.CONTENT_BG).grid(row=3, column=0, sticky="w", pady=5)
+        self.grub_color_normal = tk.StringVar(value="white/black"); ttk.Entry(gin, textvariable=self.grub_color_normal, width=15).grid(row=3, column=1, sticky="w", padx=10)
+        tk.Label(gin, text="Highlight Color (Text/Bg):", bg=self.CONTENT_BG).grid(row=4, column=0, sticky="w", pady=5)
+        self.grub_color_highlight = tk.StringVar(value="black/light-gray"); ttk.Entry(gin, textvariable=self.grub_color_highlight, width=15).grid(row=4, column=1, sticky="w", padx=10)
+        tk.Label(gin, text="Background Image (PNG/JPG):", bg=self.CONTENT_BG).grid(row=5, column=0, sticky="w", pady=5)
+        self.g_bg = tk.StringVar(); ttk.Entry(gin, textvariable=self.g_bg, width=30).grid(row=5, column=1, sticky="w", padx=10)
+        ttk.Button(gin, text="Browse", command=lambda: self.g_bg.set(filedialog.askopenfilename())).grid(row=5, column=2, sticky="w")
+        ttk.Button(gin, text="Apply GRUB Settings", style='Action.TButton', command=self.apply_grub).grid(row=6, column=0, columnspan=2, sticky="w", pady=10)
+
+        # PLYMOUTH
+        pf = tk.LabelFrame(sa, text="Plymouth Boot Splash Customizer", bg=self.CONTENT_BG, font=('Segoe UI', 10, 'bold'), fg=self.SIDEBAR_BG)
+        pf.pack(fill="x", padx=10, pady=5)
+        pin = tk.Frame(pf, bg=self.CONTENT_BG); pin.pack(anchor="w", fill="x", padx=10, pady=10)
+        tk.Label(pin, text="New Theme Name:", bg=self.CONTENT_BG).grid(row=0, column=0, sticky="w", pady=5)
+        self.plymouth_theme_name = tk.StringVar(value="my-debos-theme")
+        ttk.Entry(pin, textvariable=self.plymouth_theme_name, width=25).grid(row=0, column=1, sticky="w", padx=10)
+        tk.Label(pin, text="Splash Image (PNG Only):", bg=self.CONTENT_BG).grid(row=1, column=0, sticky="w", pady=5)
+        self.plymouth_bg_path = tk.StringVar()
+        ttk.Entry(pin, textvariable=self.plymouth_bg_path, width=30).grid(row=1, column=1, sticky="w", padx=10)
+        ttk.Button(pin, text="Browse", command=lambda: self.plymouth_bg_path.set(filedialog.askopenfilename(filetypes=[("PNG files", "*.png")]))).grid(row=1, column=2, sticky="w", padx=5)
+        ttk.Button(pin, text="Apply Plymouth Settings", style='Action.TButton', command=self.apply_plymouth).grid(row=2, column=0, columnspan=2, sticky="w", pady=10)
+        ttk.Button(pin, text="Preview Plymouth", command=lambda: self.execute_in_terminal(["plymouthd", "plymouth --show-splash", "sleep 8", "plymouth quit"], False)).grid(row=2, column=2, sticky="w", padx=5)
+
+        # DISPLAY MANAGER
+        df = tk.LabelFrame(sa, text="Login Screen Tweaks & Autologin", bg=self.CONTENT_BG, font=('Segoe UI', 10, 'bold'), fg=self.SIDEBAR_BG)
+        df.pack(fill="x", padx=10, pady=5)
+        din = tk.Frame(df, bg=self.CONTENT_BG); din.pack(anchor="w", fill="x", padx=10, pady=10)
+        tk.Label(din, text="Target DM:", bg=self.CONTENT_BG).grid(row=0, column=0, sticky="w", pady=5)
+        self.dm_target_var = tk.StringVar()
+        ttk.Combobox(din, textvariable=self.dm_target_var, values=["GDM3", "LightDM GTK", "Slick-Greeter", "SDDM"], state="readonly").grid(row=0, column=1, sticky="w", padx=10)
+        tk.Label(din, text="Bg Image:", bg=self.CONTENT_BG).grid(row=1, column=0, sticky="w", pady=5)
+        self.dm_bg = tk.StringVar(); ttk.Entry(din, textvariable=self.dm_bg, width=30).grid(row=1, column=1, sticky="w", padx=10)
+        ttk.Button(din, text="Browse", command=lambda: self.dm_bg.set(filedialog.askopenfilename())).grid(row=1, column=2, sticky="w")
+        tk.Label(din, text="GTK Theme:", bg=self.CONTENT_BG).grid(row=2, column=0, sticky="w", pady=5)
+        self.dm_gtk = tk.StringVar(value="Adwaita"); ttk.Entry(din, textvariable=self.dm_gtk, width=20).grid(row=2, column=1, sticky="w", padx=10)
+        tk.Label(din, text="Icon Theme:", bg=self.CONTENT_BG).grid(row=3, column=0, sticky="w", pady=5)
+        self.dm_ico = tk.StringVar(value="Papirus"); ttk.Entry(din, textvariable=self.dm_ico, width=20).grid(row=3, column=1, sticky="w", padx=10)
+        tk.Label(din, text="Font Name:", bg=self.CONTENT_BG).grid(row=4, column=0, sticky="w", pady=5)
+        self.dm_fnt = tk.StringVar(value="Noto Sans 11"); ttk.Entry(din, textvariable=self.dm_fnt, width=20).grid(row=4, column=1, sticky="w", padx=10)
+        
+        tk.Frame(din, height=1, bg="#CCC").grid(row=5, column=0, columnspan=3, sticky="we", pady=10)
+        self.shw_usr = tk.BooleanVar(value=True); ttk.Checkbutton(din, text="Show User List (LightDM/SDDM)", variable=self.shw_usr).grid(row=6, column=0, columnspan=2, sticky="w")
+        tk.Label(din, text="Autologin User:", bg=self.CONTENT_BG).grid(row=7, column=0, sticky="w", pady=5)
+        self.au_var = tk.StringVar(); u_cb = ttk.Combobox(din, textvariable=self.au_var, values=self.get_users(), state="readonly")
+        u_cb.grid(row=7, column=1, sticky="w", padx=10)
+        if self.get_users(): u_cb.current(0)
+        self.en_au = tk.BooleanVar(value=False); ttk.Checkbutton(din, text="Enable Autologin", variable=self.en_au).grid(row=8, column=0, columnspan=2, sticky="w")
+        
+        af = tk.Frame(din, bg=self.CONTENT_BG); af.grid(row=9, column=0, columnspan=3, sticky="w", pady=15)
+        ttk.Button(af, text="Apply Login Settings", style='Action.TButton', command=self.apply_dm).pack(side="left", padx=5)
+        ttk.Button(af, text="Install & Switch DM", style='Danger.TButton', command=self.switch_dm).pack(side="left", padx=5)
+
+    def apply_grub(self):
+        to = self.g_to.get()
+        if not to.isdigit(): return messagebox.showerror("Error", "Timeout must be a valid number.")
+        cmds = [
+            "cd /tmp || exit",
+            "echo -e '\\e[1;34m[*] Applying GRUB Configurations...\\e[0m'",
+            "cp /etc/default/grub /etc/default/grub.bak",
+            f"sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT={to}/' /etc/default/grub",
+            "sed -i '/^GRUB_COLOR_NORMAL=/d' /etc/default/grub",
+            "sed -i '/^GRUB_COLOR_HIGHLIGHT=/d' /etc/default/grub",
+            f"echo 'GRUB_COLOR_NORMAL=\"{self.grub_color_normal.get()}\"' >> /etc/default/grub",
+            f"echo 'GRUB_COLOR_HIGHLIGHT=\"{self.grub_color_highlight.get()}\"' >> /etc/default/grub"
+        ]
+        if self.g_hid.get(): cmds.extend(["sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=hidden/' /etc/default/grub", "grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub"])
+        else: cmds.extend(["sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub", "grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=menu' >> /etc/default/grub"])
+            
+        if self.g_osp.get(): cmds.extend(["sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub", "grep -q '^GRUB_DISABLE_OS_PROBER=false' /etc/default/grub || echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub"])
+        else: cmds.extend(["sed -i 's/^GRUB_DISABLE_OS_PROBER=false/#GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub"])
+            
+        bg = self.g_bg.get()
+        if bg and os.path.exists(bg):
+            ext = bg.split('.')[-1].lower()
+            cmds.extend([f"cp \"{bg}\" /boot/grub/custom_bg.{ext}", "sed -i '/^GRUB_BACKGROUND=/d' /etc/default/grub", f"echo 'GRUB_BACKGROUND=\"/boot/grub/custom_bg.{ext}\"' >> /etc/default/grub"])
+            
+        cmds.append("update-grub")
+        self.execute_in_terminal(cmds)
+
+    def apply_plymouth(self):
+        bg = self.plymouth_bg_path.get()
+        if not bg or not os.path.exists(bg): return messagebox.showwarning("Warning", "Please select a valid PNG image for Plymouth.")
+        theme = self.plymouth_theme_name.get().replace(" ", "-").lower() or "my-theme"
+        cmds = [
+            "echo -e '\\e[1;34m[*] Installing Plymouth and configuring custom theme...\\e[0m'",
+            "apt-get update && apt-get install -y plymouth plymouth-themes",
+            "THEME_BASE='/usr/share/plymouth/themes'",
+            "SOURCE_THEME='bgrt'",
+            "[ ! -d \"$THEME_BASE/$SOURCE_THEME\" ] && SOURCE_THEME=$(ls $THEME_BASE | grep -v 'my-theme' | head -n1)",
+            f"DST_DIR=\"$THEME_BASE/{theme}\"",
+            "rm -rf \"$DST_DIR\"",
+            "cp -a \"$THEME_BASE/$SOURCE_THEME\" \"$DST_DIR\"",
+            "OLD_IMG=$(find \"$DST_DIR\" -maxdepth 1 -type f -iname '*.png' | head -n1)",
+            f"[ -n \"$OLD_IMG\" ] && cp \"{bg}\" \"$OLD_IMG\" && chmod 644 \"$OLD_IMG\"",
+            "PLY_FILE=$(find \"$DST_DIR\" -maxdepth 1 -type f -iname '*.plymouth' | head -n1)",
+            f"sed -i 's/^Name=.*/Name={theme}/I' \"$PLY_FILE\"",
+            "sed -i \"s|ImageDir=.*|ImageDir=$DST_DIR|\" \"$PLY_FILE\"",
+            "update-alternatives --install /usr/share/plymouth/themes/default.plymouth default.plymouth \"$PLY_FILE\" 200",
+            "update-alternatives --set default.plymouth \"$PLY_FILE\"",
+            "update-initramfs -u"
+        ]
+        self.execute_in_terminal(cmds)
+
+    def switch_dm(self):
+        dm = self.dm_target_var.get()
+        if not dm: return messagebox.showwarning("Warning", "Please select a Target Display Manager.")
+        
+        pkg_map = {"GDM3": "gdm3", "LightDM GTK": "lightdm lightdm-gtk-greeter", "Slick-Greeter": "lightdm slick-greeter", "SDDM": "sddm"}
+        dm_pkg = pkg_map.get(dm)
+        dm_service = dm_pkg.split()[0]
+        
+        confirm = messagebox.askyesno("Confirm Installation", f"This will install {dm_pkg} and set it as default. You will need to reboot afterwards. Continue?")
+        if confirm:
+            cmds = [
+                f"echo -e '\\e[1;34m[*] Installing and Switching to {dm}...\\e[0m'",
+                "apt-get update",
+                f"apt-get install -y {dm_pkg}",
+                f"echo \"{dm_service} shared/default-x-display-manager select {dm_service}\" | debconf-set-selections",
+                f"dpkg-reconfigure -f noninteractive {dm_service}",
+                "systemctl disable gdm3 lightdm sddm lxdm || true",
+                f"systemctl enable {dm_service} --now || true",
+                "echo -e '\\e[1;32m[*] Display Manager updated. Please Reboot.\\e[0m'"
+            ]
+            self.execute_in_terminal(cmds)
+
+    def apply_dm(self):
+        dm = self.dm_target_var.get()
+        if not dm: return messagebox.showwarning("Warning", "Please select a Target Display Manager.")
+        bg = self.dm_bg.get()
+        gtk = self.dm_gtk.get()
+        icon = self.dm_ico.get()
+        font = self.dm_fnt.get()
+        user = self.au_var.get()
+        autologin = self.en_au.get()
+        show_users = str(self.shw_usr.get()).lower()
+        
+        cmds = [f"echo -e '\\e[1;34m[*] Applying Settings for {dm}...\\e[0m'"]
+        
+        if dm == "GDM3":
+            if bg:
+                cmds.extend([
+                    "mkdir -p /etc/dconf/db/gdm.d",
+                    f"echo -e '[org/gnome/desktop/background]\\npicture-uri=\\'file://{bg}\\'\\npicture-uri-dark=\\'file://{bg}\\'' > /etc/dconf/db/gdm.d/01-background",
+                    "dconf update || true"
+                ])
+            if autologin and user:
+                cmds.extend([
+                    "sed -i '/^AutomaticLoginEnable=/d' /etc/gdm3/daemon.conf",
+                    "sed -i '/^AutomaticLogin=/d' /etc/gdm3/daemon.conf",
+                    f"sed -i '/\\[daemon\\]/a AutomaticLoginEnable=True\\nAutomaticLogin={user}' /etc/gdm3/daemon.conf"
+                ])
+            else:
+                cmds.extend(["sed -i 's/^AutomaticLoginEnable=True/AutomaticLoginEnable=False/' /etc/gdm3/daemon.conf"])
+
+        elif dm in ["LightDM GTK", "Slick-Greeter"]:
+            conf = '/etc/lightdm/lightdm-gtk-greeter.conf' if dm == "LightDM GTK" else '/etc/lightdm/slick-greeter.conf'
+            section = '[greeter]' if dm == "LightDM GTK" else '[Greeter]'
+            cmds.extend([
+                f"conf='{conf}'",
+                "mkdir -p /etc/lightdm",
+                "touch \"$conf\"",
+                "cp -n \"$conf\" \"$conf.bak\" || true",
+                f"awk -v bg='{bg}' -v theme='{gtk}' -v icon='{icon}' -v font='{font}' '"
+                f"BEGIN {{found=0}} /^{section.replace('[','\\[').replace(']', '\\]')}/ {{found=1; print; next}} found==1 && /^(background|theme-name|icon-theme-name|font-name)=/ {{next}} {{print}} END {{if(found==0) print \"{section}\"; if(bg!=\"\") print \"background=\"bg; print \"theme-name=\"theme; print \"icon-theme-name=\"icon; print \"font-name=\"font}}' \"$conf\" > \"$conf.tmp\" && mv \"$conf.tmp\" \"$conf\""
+            ])
+            
+            # Lightdm config for Autologin and Hide users
+            hide_users = "true" if show_users == "false" else "false"
+            cmds.extend([
+                "l_conf='/etc/lightdm/lightdm.conf'",
+                "touch \"$l_conf\"",
+                f"sed -i '/^greeter-hide-users=/d' \"$l_conf\"",
+                f"sed -i '/\\[Seat:\\*\\]/a greeter-hide-users={hide_users}' \"$l_conf\""
+            ])
+            
+            if autologin and user:
+                cmds.extend([
+                    f"sed -i '/^autologin-user=/d' \"$l_conf\"",
+                    f"sed -i '/^autologin-user-timeout=/d' \"$l_conf\"",
+                    f"sed -i '/\\[Seat:\\*\\]/a autologin-user={user}\\nautologin-user-timeout=0' \"$l_conf\""
+                ])
+            else:
+                cmds.extend([f"sed -i '/^autologin-user=/d' \"$l_conf\""])
+
+        elif dm == "SDDM":
+            cmds.extend([
+                "sddm_conf='/etc/sddm.conf'",
+                "[ -f /etc/sddm.conf.d/kde_settings.conf ] && sddm_conf='/etc/sddm.conf.d/kde_settings.conf'",
+                "mkdir -p $(dirname \"$sddm_conf\")",
+                "touch \"$sddm_conf\"",
+                "cp -n \"$sddm_conf\" \"$sddm_conf.bak\" || true",
+                "awk -v theme='breeze' 'BEGIN{found=0} /^\\[Theme\\]/{found=1; print; next} found==1 && /^Current=/{next} {print} END{if(found==0) print \"[Theme]\"; print \"Current=\"theme}' \"$sddm_conf\" > \"$sddm_conf.tmp\" && mv \"$sddm_conf.tmp\" \"$sddm_conf\""
+            ])
+            if bg:
+                cmds.append(f"[ -f '/usr/share/sddm/themes/breeze/theme.conf' ] && awk -v bg='{bg}' 'BEGIN{{found=0}} /^background=/{{found=1; print \"background=\"bg; next}} {{print}} END{{if(found==0) print \"background=\"bg}}' /usr/share/sddm/themes/breeze/theme.conf > /usr/share/sddm/themes/breeze/theme.conf.tmp && mv /usr/share/sddm/themes/breeze/theme.conf.tmp /usr/share/sddm/themes/breeze/theme.conf")
+            
+            # SDDM Autologin and Hide Users
+            hide_users = "true" if show_users == "false" else "false"
+            if autologin and user:
+                cmds.extend([
+                    "awk -v user='" + user + "' 'BEGIN{found=0} /^\\[Autologin\\]/{found=1; print; next} found==1 && /^(User|Session)=/{next} {print} END{if(found==0) print \"[Autologin]\"; print \"User=\"user; print \"Session=plasma\"}' \"$sddm_conf\" > \"$sddm_conf.tmp\" && mv \"$sddm_conf.tmp\" \"$sddm_conf\""
+                ])
+            else:
+                cmds.extend(["sed -i '/^User=/d' \"$sddm_conf\""])
+                
+            cmds.extend([
+                "awk -v hide='" + hide_users + "' 'BEGIN{found=0} /^\\[Users\\]/{found=1; print; next} found==1 && /^HideUsers=/{next} {print} END{if(found==0) print \"[Users]\"; if(hide==\"true\") print \"HideUsers=*\"}' \"$sddm_conf\" > \"$sddm_conf.tmp\" && mv \"$sddm_conf.tmp\" \"$sddm_conf\""
+            ])
+
+        cmds.append("echo -e '\\e[1;32m[*] Done. Restart your display manager or reboot to see changes.\\e[0m'")
+        self.execute_in_terminal(cmds)
+
+    def setup_sources_page(self):
+        f = ttk.Frame(self.content_area); self.pages["sources"] = f
+        
+        ttk.Label(f, text="Edit APT Sources.list & Upgrade", style='Header.TLabel').pack(anchor="w", pady=(0, 10))
+        ttk.Label(f, text="Modify your APT sources list below. Useful for upgrading OS version (e.g., bookworm to trixie).", wraplength=600).pack(anchor="w", pady=5)
+        
+        ff = tk.Frame(f, bg=self.CONTENT_BG); ff.pack(anchor="w", fill="x", pady=5)
+        tk.Label(ff, text="Target File:", font=('Segoe UI', 10, 'bold'), bg=self.CONTENT_BG).pack(side="left", padx=(0, 10))
+        
+        self.src_var = tk.StringVar(value="/etc/apt/sources.list.d/debian.sources")
+        files = ["/etc/apt/sources.list.d/debian.sources", "/etc/apt/sources.list", "/etc/apt/sources.list.d/sources.list", "/etc/apt/sources.list.d/official-package-repositories.list"]
+        self.sources_dropdown = ttk.Combobox(ff, textvariable=self.src_var, values=files, width=50)
+        self.sources_dropdown.pack(side="left", padx=5)
+        ttk.Button(ff, text="Load File", command=self.load_sources_list).pack(side="left", padx=5)
+
+        self.src_txt = tk.Text(f, height=15, width=80, font=('Consolas', 10), bd=1, relief="solid", bg="#FFFFFF")
+        self.src_txt.pack(anchor="w", pady=10, fill="both", expand=True)
+        
+        bf = tk.Frame(f, bg=self.CONTENT_BG); bf.pack(anchor="w", pady=10)
+        
+        ttk.Button(bf, text="Save File", style='Action.TButton', command=self.save_sources).pack(side="left", padx=(0, 15))
+        ttk.Button(bf, text="Update Sources (apt update)", command=lambda: self.execute_in_terminal(["apt-get update"], pause=False)).pack(side="left", padx=(0, 15))
+        ttk.Button(bf, text="Run System Upgrade (dist-upgrade)", style='Danger.TButton', command=self.run_os_upgrade).pack(side="left")
+
+    def load_sources_list(self):
+        path = self.src_var.get()
+        self.src_txt.delete("1.0", tk.END)
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f: content = f.read()
+                self.src_txt.insert(tk.END, content)
+            except Exception as e: self.src_txt.insert(tk.END, f"# Error loading {path}: {e}")
+        else:
+            self.src_txt.insert(tk.END, f"# File {path} does not exist yet.\n# You can add sources here and save to create it.")
+
+    def save_sources(self):
+        path = self.src_var.get()
+        content = self.src_txt.get("1.0", tk.END)
+        try:
+            with open("/tmp/sources_temp.list", "w") as f: f.write(content)
+            cmds = [
+                f"echo -e '\\e[1;34m[*] Backing up and saving {path}...\\e[0m'",
+                f"[ -f \"{path}\" ] && cp \"{path}\" \"{path}.bak\"",
+                f"mkdir -p $(dirname \"{path}\")",
+                f"cp /tmp/sources_temp.list \"{path}\""
+            ]
+            self.execute_in_terminal(cmds, pause=False)
+            messagebox.showinfo("Success", f"File saved successfully to {path}. You can now click 'Update Sources'.")
+        except Exception as e: messagebox.showerror("Error", f"Failed to prepare file: {e}")
+
+    def run_os_upgrade(self):
+        confirm = messagebox.askyesno("Confirm Upgrade", "Are you sure you want to run a full system upgrade?\nThis will run 'apt-get update && apt-get dist-upgrade -y'.\nEnsure your sources.list is correctly configured.")
+        if confirm:
+            cmds = [
+                "echo -e '\\e[1;34m[*] Starting Full System Upgrade...\\e[0m'",
+                "apt-get update",
+                "apt-get dist-upgrade -y",
+                "apt-get autoremove -y",
+                "echo -e '\\e[1;32m[*] Upgrade process completed. A system reboot is highly recommended.\\e[0m'"
+            ]
+            self.execute_in_terminal(cmds)
+
+    def setup_about_page(self):
+        f = ttk.Frame(self.content_area); self.pages["about"] = f
+        ttk.Label(f, text="About Debos - Toolbox & Settings", style='Header.TLabel').pack(anchor="w", pady=(0, 10))
+        sa = self.create_scroll_area(f)
+        
+        txt = "Version 0.4.29.1\nDeveloper: Hugo Moniz do Rego\nLocation: Timor-Leste\n\nAdvanced System Cleaner, Driver, Network, Software and Kernel Installer for Debian.\nLicense: OpenSource, GNU/Linux, FDSL - TL.\n\nCredits & Sources:\n• Logic inspired by ubuntu-cleaner & iven.in.\n• UI Design inspired by modern flat utility apps."
+        tk.Label(sa, text=txt, justify="left", bg=self.CONTENT_BG, font=('Segoe UI', 10)).pack(anchor="w", pady=(0, 10))
+        
+        img_f = tk.Frame(sa, bg=self.CONTENT_BG); img_f.pack(anchor="w", pady=5)
+        try:
+            self.i1 = ImageTk.PhotoImage(Image.open("/usr/share/pixmaps/debos-debian.png").resize((80, 80)))
+            tk.Button(img_f, image=self.i1, bd=0, command=lambda: webbrowser.open("https://www.debian.org/")).pack(side="left", padx=10)
+            self.i2 = ImageTk.PhotoImage(Image.open("/usr/share/pixmaps/debos-fdsl.png").resize((80, 80)))
+            tk.Button(img_f, image=self.i2, bd=0, command=lambda: webbrowser.open("https://www.fdsl.tl/")).pack(side="left", padx=10)
+            self.i3 = ImageTk.PhotoImage(Image.open("/usr/share/pixmaps/debos-linux.png").resize((80, 80)))
+            tk.Button(img_f, image=self.i3, bd=0, command=lambda: webbrowser.open("https://www.linuxfoundation.org/")).pack(side="left", padx=10)
+            self.i4 = ImageTk.PhotoImage(Image.open("/usr/share/pixmaps/debos-github.png").resize((80, 80)))
+            tk.Button(img_f, image=self.i4, bd=0, command=lambda: webbrowser.open("https://github.com/hugomonizdorego")).pack(side="left", padx=10)
+        except: pass
+
+        self.autostart_file = os.path.expanduser("~/.config/autostart/debos-toolbox.desktop")
+        self.autostart_var = tk.BooleanVar(value=os.path.exists(self.autostart_file))
+        ttk.Checkbutton(sa, text="Run at System Startup (Background Health Monitor)", variable=self.autostart_var, command=self.toggle_autostart).pack(anchor="w", pady=(15, 10))
+        
+        ff = tk.Frame(sa, bg=self.CONTENT_BG); ff.pack(anchor="w", fill="x", pady=20)
+        tk.Label(ff, text="Send Feedback & Suggestions", font=('Segoe UI', 12, 'bold'), bg=self.CONTENT_BG).grid(row=0, column=0, columnspan=2, sticky="w", pady=5)
+        tk.Label(ff, text="Name:", bg=self.CONTENT_BG).grid(row=1, column=0, sticky="w", pady=2)
+        self.fb_name = tk.Entry(ff, width=40); self.fb_name.grid(row=1, column=1, pady=2, padx=5)
+        tk.Label(ff, text="Email:", bg=self.CONTENT_BG).grid(row=2, column=0, sticky="w", pady=2)
+        self.fb_email = tk.Entry(ff, width=40); self.fb_email.grid(row=2, column=1, pady=2, padx=5)
+        
+        distro = "Unknown"
+        try:
+            with open("/etc/os-release") as file:
+                for line in file:
+                    if line.startswith("PRETTY_NAME="): distro = line.split("=")[1].strip().strip('"')
+        except: pass
+        tk.Label(ff, text="OS/Distro:", bg=self.CONTENT_BG).grid(row=3, column=0, sticky="w", pady=2)
+        self.fb_distro = tk.Entry(ff, width=40); self.fb_distro.insert(0, distro); self.fb_distro.grid(row=3, column=1, pady=2, padx=5)
+        tk.Label(ff, text="Message:", bg=self.CONTENT_BG).grid(row=4, column=0, sticky="nw", pady=2)
+        self.fb_msg = tk.Text(ff, height=4, width=40, font=('Segoe UI', 10), bd=0, highlightbackground="#CCC", highlightcolor="#3498DB", highlightthickness=1)
+        self.fb_msg.grid(row=4, column=1, pady=2, padx=5)
+        ttk.Button(ff, text="Send via Mail Client", style='Action.TButton', command=self.send_feedback).grid(row=5, column=1, sticky="w", pady=10)
+
+    def toggle_autostart(self):
+        if self.autostart_var.get():
+            os.makedirs(os.path.dirname(self.autostart_file), exist_ok=True)
+            with open(self.autostart_file, "w") as f:
+                f.write("[Desktop Entry]\nType=Application\nExec=/usr/bin/debos-toolbox --startup\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\nName=Debos System Monitor\nComment=Checks system health\nIcon=/usr/share/pixmaps/debos-toolbox.png\n")
+        else:
+            if os.path.exists(self.autostart_file): os.remove(self.autostart_file)
+
+    def send_feedback(self):
+        name = self.fb_name.get().strip()
+        msg = self.fb_msg.get("1.0", tk.END).strip()
+        if not msg or not name: return messagebox.showwarning("Warning", "Name and Message are required.")
+        body = urllib.parse.quote(f"Name: {name}\nEmail: {self.fb_email.get().strip()}\nOS: {self.fb_distro.get().strip()}\n\nFeedback:\n{msg}")
+        webbrowser.open(f"mailto:hugomonizdorego@gmail.com?subject=Feedback for Debos-Toolbox&body={body}")
+
+    def setup_license_page(self):
+        f = ttk.Frame(self.content_area); self.pages["license"] = f
+        ttk.Label(f, text="License & Legal", style='Header.TLabel').pack(pady=10)
+        txt = """Debos - Toolbox v0.4.29.1
+Copyright (c) 2026 Hugo Moniz do Rego.
+
+This application is Open Source Software. You are free to modify, distribute, and enhance it, provided that the original author (Hugo Moniz do Rego) is explicitly credited in all derivative works.
+
+• Linux® is the registered trademark of Linus Torvalds.
+• Debian is a registered trademark of Software in the Public Interest, Inc.
+• FDSL - TL (Free and Open Source Software Timor-Leste).
+• GNU Software / GNU/Linux are trademarks of the Free Software Foundation.
+
+AI ASSISTANCE DISCLOSURE:
+This software was developed with the assistance of Google Gemini and Microsoft Copilot. Code snippets generated by these AI models are subject to their respective Terms of Service and open-source compliance policies. AI-generated content is provided "AS-IS" without express or implied warranties. The author and the aforementioned AI providers hold no liability for any potential system instability resulting from the use of this software."""
+        t = tk.Text(f, bg="#f5f6fa", font=('Segoe UI', 10), relief="flat", height=15); t.insert("1.0", txt); t.config(state="disabled"); t.pack(fill="x", padx=5, pady=5)
+        
+        df = tk.Frame(f, bg=self.CONTENT_BG); df.pack(pady=20)
+        ttk.Label(df, text="Support the Developer:", font=('Segoe UI', 11, 'bold'), background=self.CONTENT_BG).pack(pady=5)
+        try:
+            self.paypal_img = ImageTk.PhotoImage(Image.open("/usr/share/pixmaps/debos-paypal.png").resize((120, 60)))
+            tk.Button(df, image=self.paypal_img, bd=0, bg=self.CONTENT_BG, cursor="hand2", command=lambda: webbrowser.open("https://www.paypal.com/paypalme/hugocenturion0311")).pack()
+        except:
+            ttk.Button(df, text="Donate via PayPal", style='Action.TButton', command=lambda: webbrowser.open("https://www.paypal.com/paypalme/hugocenturion0311")).pack()
+
+if __name__ == "__main__":
+    root = tk.Tk(); app = DebosToolboxApp(root); root.mainloop()

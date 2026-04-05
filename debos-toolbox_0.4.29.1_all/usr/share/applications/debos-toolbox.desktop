@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Debos - Toolbox
+Comment=Clean system caches, manage kernels, drivers, network, customize UI, and install software
+Exec=/usr/bin/debos-toolbox
+Icon=/usr/share/pixmaps/debos-toolbox.png
+Terminal=false
+Type=Application
+Categories=System;Settings;Administration;
