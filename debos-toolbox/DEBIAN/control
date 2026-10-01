@@ -1,0 +1,25 @@
+Package: debos-toolbox
+Version: 0.5.0
+Section: admin
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), python3-tk, sudo, pciutils, usbutils, curl, wget, gpg, ca-certificates, xterm | x-terminal-emulator
+Recommends: python3-pil, python3-pil.imagetk, libnotify-bin, network-manager, flatpak, extrepo, fdupes
+Suggests: timeshift, inxi, nmap, speedtest-cli, macchanger, apt-listbugs
+Maintainer: Hugo Moniz do Rego <hugomonizdorego@gmail.com>
+Homepage: https://github.com/hugomonizdorego/Debos---Toolbox
+Description: All-in-one GUI toolbox for Debian Stable, Testing, Sid and LMDE
+ Debos - Toolbox gathers the everyday administration tasks of a Debian
+ desktop in a single, modern interface:
+  - dashboard with system health, updates and quick maintenance actions
+  - safe system cleaning and APT / GPG key repair
+  - Debian Stable / Testing / Sid branch switching with deb822 sources
+  - software installation from Debian, vendor repositories and Flathub
+  - desktop environments, window managers and kernels (XanMod,
+    Liquorix, Linux-libre, backports, mainline builds)
+  - drivers, firmware, network, tweaks, GRUB, Plymouth and login screen
+ .
+ Every privileged action runs as a visible script in a terminal and is
+ logged to /var/log/debos-toolbox.log.
+ .
+ Developed in Timor-Leste. License: GNU GPL v3 - FDSL - TL.

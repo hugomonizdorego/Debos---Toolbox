@@ -1,0 +1,3004 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+Debos - Toolbox
+The all-in-one GUI toolbox for Debian (Stable, Testing, Sid) and LMDE.
+
+Copyright (c) 2026 Hugo Moniz do Rego - Timor-Leste.
+Open Source software - see /usr/share/doc/debos-toolbox or the License page.
+
+Every privileged action is turned into a small, readable bash script that is
+executed with sudo inside a terminal window, so the user always sees exactly
+what is happening. All output is also appended to /var/log/debos-toolbox.log.
+"""
+
+import getpass
+import glob
+import json
+import os
+import pwd
+import queue
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.parse
+import webbrowser
+
+APP_NAME = "Debos - Toolbox"
+APP_ID = "debos-toolbox"
+APP_VERSION = "0.5.0"
+APP_BUILD = "20261001"
+APP_URL = "https://github.com/hugomonizdorego/Debos---Toolbox"
+AUTHOR = "Hugo Moniz do Rego"
+AUTHOR_MAIL = "hugomonizdorego@gmail.com"
+PAYPAL_URL = "https://www.paypal.com/paypalme/hugocenturion0311"
+ICON_PATH = "/usr/share/pixmaps/debos-toolbox.png"
+PAYPAL_IMG = "/usr/share/pixmaps/debos-paypal.png"
+LOG_FILE = "/var/log/debos-toolbox.log"
+BACKUP_DIR = "/var/backups/debos-toolbox"
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), APP_ID)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
+
+
+# ---------------------------------------------------------------------------
+# Debian release knowledge
+# ---------------------------------------------------------------------------
+DEBIAN_RELEASES = {"bullseye": "11", "bookworm": "12", "trixie": "13", "forky": "14", "duke": "15"}
+OLDOLDSTABLE_CODENAME = "bullseye"
+OLDSTABLE_CODENAME = "bookworm"
+STABLE_CODENAME = "trixie"
+TESTING_CODENAME = "forky"
+# Codenames that third-party vendors (Docker, WineHQ, XanMod, VirtualBox...) publish for.
+THIRD_PARTY_CODENAMES = ("bookworm", "trixie")
+BRANCH_RANK = {"oldoldstable": 0, "oldstable": 1, "stable": 2, "testing": 3, "sid": 4}
+BRANCH_LABEL = {
+    "oldoldstable": "Oldoldstable", "oldstable": "Oldstable", "stable": "Stable",
+    "testing": "Testing", "sid": "Unstable (Sid)", "unknown": "Unknown",
+}
+DEBIAN_MIRROR = "https://deb.debian.org/debian"
+DEBIAN_SECURITY = "https://security.debian.org/debian-security"
+DEBIAN_KEYRING = "/usr/share/keyrings/debian-archive-keyring.gpg"
+
+
+def run_cmd(args, timeout=10, shell=False):
+    """Run a command and return stdout ('' on any failure). Never raises."""
+    try:
+        res = subprocess.run(args, capture_output=True, text=True, timeout=timeout, shell=shell)
+        return res.stdout.strip()
+    except Exception:
+        return ""
+
+
+def read_file(path, default=""):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return default
+
+
+def parse_os_release():
+    data = {}
+    for line in read_file("/etc/os-release").splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            data[k.strip()] = v.strip().strip('"').strip("'")
+    return data
+
+
+def apt_source_files():
+    files = []
+    if os.path.isfile("/etc/apt/sources.list"):
+        files.append("/etc/apt/sources.list")
+    files += sorted(glob.glob("/etc/apt/sources.list.d/*.list"))
+    files += sorted(glob.glob("/etc/apt/sources.list.d/*.sources"))
+    return files
+
+
+def official_debian_suites():
+    """Return the set of suites used by enabled official Debian repositories."""
+    suites = set()
+    debian_uri = re.compile(r"(debian\.org|/debian(-security)?/?$)")
+    for path in apt_source_files():
+        text = read_file(path)
+        if path.endswith(".sources"):
+            for stanza in re.split(r"\n\s*\n", text):
+                fields = {}
+                for line in stanza.splitlines():
+                    if ":" in line and not line.lstrip().startswith("#"):
+                        k, v = line.split(":", 1)
+                        fields[k.strip().lower()] = v.strip()
+                if fields.get("enabled", "yes").lower() == "no":
+                    continue
+                if "main" in fields.get("components", "").split() and any(debian_uri.search(u) for u in fields.get("uris", "").split()):
+                    suites.update(fields.get("suites", "").split())
+        else:
+            for line in text.splitlines():
+                parts = re.sub(r"\[[^\]]*\]", "", line).split()
+                if len(parts) >= 4 and parts[0] in ("deb", "deb-src") and debian_uri.search(parts[1]) and "main" in parts[3:]:
+                    suites.add(parts[2])
+    return {s.split("-")[0] if s.split("-")[-1] in ("updates", "security", "backports", "proposed") else s for s in suites}
+
+
+def detect_system():
+    osr = parse_os_release()
+    info = {
+        "pretty": osr.get("PRETTY_NAME", "Unknown Linux"),
+        "id": osr.get("ID", ""),
+        "id_like": osr.get("ID_LIKE", ""),
+        "version_id": osr.get("VERSION_ID", ""),
+        "codename": osr.get("VERSION_CODENAME", ""),
+        "debian_codename": osr.get("DEBIAN_CODENAME", "") or osr.get("VERSION_CODENAME", ""),
+        "debian_version": read_file("/etc/debian_version").strip(),
+        "branch": "unknown",
+        "is_lmde": False,
+        "is_debian_family": False,
+        "has_apt": shutil.which("apt-get") is not None,
+    }
+    info["is_debian_family"] = info["id"] == "debian" or "debian" in info["id_like"].split()
+    info["is_lmde"] = info["id"] == "linuxmint" and bool(osr.get("DEBIAN_CODENAME"))
+
+    codename = info["debian_codename"]
+    rolling = info["id"] == "debian" and ("sid" in info["debian_version"] or not info["version_id"])
+    if rolling:
+        suites = official_debian_suites()
+        if suites & {"sid", "unstable"}:
+            info["branch"], info["debian_codename"] = "sid", "sid"
+        else:
+            info["branch"] = "testing"
+            if not codename or codename == "sid":
+                info["debian_codename"] = TESTING_CODENAME
+    elif codename == STABLE_CODENAME:
+        info["branch"] = "stable"
+    elif codename == OLDSTABLE_CODENAME:
+        info["branch"] = "oldstable"
+    elif codename == OLDOLDSTABLE_CODENAME:
+        info["branch"] = "oldoldstable"
+    elif codename == TESTING_CODENAME:
+        info["branch"] = "testing"
+
+    dc = info["debian_codename"]
+    info["repo_codename"] = dc if dc in THIRD_PARTY_CODENAMES else STABLE_CODENAME
+    info["debian_number"] = DEBIAN_RELEASES.get(dc, "")
+    info["arch"] = run_cmd(["dpkg", "--print-architecture"]) or "amd64"
+    return info
+
+
+def branch_badge(info):
+    if info["is_lmde"]:
+        num = DEBIAN_RELEASES.get(info["debian_codename"], "?")
+        return f"{info['pretty']}  ·  based on Debian {num} ({info['debian_codename']})"
+    if info["id"] == "debian":
+        label = BRANCH_LABEL.get(info["branch"], "Unknown")
+        if info["branch"] == "sid":
+            return "Debian sid  ·  Unstable"
+        num = info["debian_number"]
+        return f"Debian {num} ({info['debian_codename']})  ·  {label}".replace("Debian  (", "Debian (")
+    return info["pretty"]
+
+
+def secure_boot_enabled():
+    for path in glob.glob("/sys/firmware/efi/efivars/SecureBoot-*"):
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()[-1] == 1
+        except Exception:
+            return False
+    return False
+
+
+def cpu_x86_level():
+    """Return the x86-64 micro-architecture level (1-4), or 0 if not x86-64."""
+    flags = set()
+    for line in read_file("/proc/cpuinfo").splitlines():
+        if line.startswith("flags"):
+            flags = set(line.split(":", 1)[1].split())
+            break
+    if not flags or "lm" not in flags:
+        return 0
+    v2 = {"cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3"}
+    v3 = {"avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "abm", "movbe", "xsave"}
+    v4 = {"avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"}
+    level = 1
+    if v2 <= flags:
+        level = 2
+        if v3 <= flags:
+            level = 3
+            if v4 <= flags:
+                level = 4
+    return level
+
+
+def target_user():
+    """The desktop user, even if the GUI itself was started through sudo."""
+    name = os.environ.get("SUDO_USER") or os.environ.get("PKEXEC_UID") or getpass.getuser()
+    try:
+        if name.isdigit():
+            entry = pwd.getpwuid(int(name))
+        else:
+            entry = pwd.getpwnam(name)
+        return entry.pw_name, entry.pw_dir
+    except Exception:
+        return getpass.getuser(), os.path.expanduser("~")
+
+
+def human_size(num):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num < 1024 or unit == "TB":
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} TB"
+
+
+def dir_size(path):
+    total = 0
+    for base, _dirs, files in os.walk(path, onerror=lambda e: None):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(base, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def installed_packages():
+    out = run_cmd(["dpkg-query", "-W", "-f=${Package}\t${db:Status-Abbrev}\n"], timeout=20)
+    return {line.split("\t")[0] for line in out.splitlines() if "\t" in line and line.split("\t")[1].startswith("ii")}
+
+
+def installed_flatpaks():
+    if not shutil.which("flatpak"):
+        return set()
+    return set(run_cmd(["flatpak", "list", "--app", "--columns=application"], timeout=20).split())
+
+
+# ---------------------------------------------------------------------------
+# Startup health monitor (runs without a GUI)
+# ---------------------------------------------------------------------------
+def startup_health_check():
+    def notify(urgency, msg):
+        if shutil.which("notify-send"):
+            subprocess.run(["notify-send", "-u", urgency, "-i", ICON_PATH, APP_NAME, msg])
+
+    if run_cmd(["dpkg", "--audit"], timeout=30):
+        notify("critical", "Broken or half-configured packages detected. Open Debos - Toolbox > Repair APT & Keys.")
+    sim = run_cmd(["apt-get", "-s", "-o", "Debug::NoLocking=1", "dist-upgrade"], timeout=60)
+    count = sum(1 for line in sim.splitlines() if line.startswith("Inst "))
+    if count:
+        notify("normal", f"{count} package update(s) available. Open Debos - Toolbox > Updates & Release.")
+    usage = shutil.disk_usage("/")
+    if usage.free < 2 * 1024 ** 3:
+        notify("critical", f"Low disk space on / ({human_size(usage.free)} free). Run Clean System.")
+
+
+# ---------------------------------------------------------------------------
+# Translations (English is the default and the fallback language)
+# ---------------------------------------------------------------------------
+LANG_NAMES = {"en": "English", "id": "Bahasa Indonesia", "pt": "Português"}
+
+STRINGS = {
+    "en": {
+        "sec_overview": "OVERVIEW", "sec_maintenance": "MAINTENANCE", "sec_software": "SOFTWARE",
+        "sec_system": "SYSTEM", "sec_info": "INFO",
+        "nav_dashboard": "Dashboard", "nav_clean": "Clean System", "nav_repair": "Repair APT & Keys",
+        "nav_release": "Updates & Release", "nav_sources": "APT Sources", "nav_install": "Install Software",
+        "nav_uninstall": "Uninstall Software", "nav_desktops": "Desktops & WMs", "nav_kernels": "Kernels",
+        "nav_drivers": "Drivers & Hardware", "nav_network": "Network", "nav_tweaks": "Tweaks & Tools",
+        "nav_customizer": "Customizer", "nav_about": "About & Feedback", "nav_license": "License",
+        "sub_dashboard": "System overview and one-click maintenance.",
+        "sub_clean": "Free disk space safely. Every action is shown in a terminal before it runs.",
+        "sub_repair": "Fix interrupted installs, broken dependencies, duplicate sources and missing GPG keys.",
+        "sub_release": "Keep your system up to date and move between Debian Stable, Testing and Sid.",
+        "sub_sources": "View and edit APT repository files. A backup is made before every save.",
+        "sub_install": "Install applications from Debian, official vendor repositories or Flathub.",
+        "sub_uninstall": "Remove installed desktop applications (APT and Flatpak).",
+        "sub_desktops": "Install, switch or remove desktop environments and window managers.",
+        "sub_kernels": "Install optimized kernels or remove kernels you no longer need.",
+        "sub_drivers": "Detect hardware and install graphics, Wi-Fi, firmware and peripheral drivers.",
+        "sub_network": "Diagnostics, DNS, firewall, remote access and MAC address tools.",
+        "sub_tweaks": "Performance, security and convenience tweaks plus diagnostic tools.",
+        "sub_customizer": "Customize GRUB, the Plymouth boot splash and the login screen.",
+        "sub_about": "Version information, settings and feedback.",
+        "sub_license": "License, trademarks and disclosures.",
+        "run_selected": "Run Selected", "refresh": "Refresh", "select_all": "Select All", "clear": "Clear",
+        "search": "Search", "language": "Language", "theme": "Theme", "light": "Light", "dark": "Dark",
+        "ready": "Ready", "terminal_opened": "Terminal opened", "nothing_selected": "Nothing selected.",
+        "installed": "installed", "recommended": "recommended", "loading": "Loading...",
+    },
+    "id": {
+        "sec_overview": "IKHTISAR", "sec_maintenance": "PERAWATAN", "sec_software": "PERANGKAT LUNAK",
+        "sec_system": "SISTEM", "sec_info": "INFO",
+        "nav_dashboard": "Dasbor", "nav_clean": "Bersihkan Sistem", "nav_repair": "Perbaiki APT & Kunci",
+        "nav_release": "Pembaruan & Rilis", "nav_sources": "Sumber APT", "nav_install": "Instal Aplikasi",
+        "nav_uninstall": "Copot Aplikasi", "nav_desktops": "Desktop & WM", "nav_kernels": "Kernel",
+        "nav_drivers": "Driver & Perangkat Keras", "nav_network": "Jaringan", "nav_tweaks": "Tweak & Alat",
+        "nav_customizer": "Kustomisasi", "nav_about": "Tentang & Masukan", "nav_license": "Lisensi",
+        "sub_dashboard": "Ringkasan sistem dan perawatan sekali klik.",
+        "sub_clean": "Kosongkan ruang disk dengan aman. Setiap aksi ditampilkan di terminal.",
+        "sub_repair": "Perbaiki instalasi terputus, dependensi rusak, sumber ganda dan kunci GPG yang hilang.",
+        "sub_release": "Jaga sistem tetap terbaru dan pindah antara Debian Stable, Testing dan Sid.",
+        "sub_sources": "Lihat dan edit berkas repositori APT. Cadangan dibuat sebelum menyimpan.",
+        "sub_install": "Instal aplikasi dari Debian, repositori resmi vendor atau Flathub.",
+        "sub_uninstall": "Hapus aplikasi desktop yang terpasang (APT dan Flatpak).",
+        "sub_desktops": "Instal, ganti atau hapus lingkungan desktop dan window manager.",
+        "sub_kernels": "Instal kernel teroptimasi atau hapus kernel yang tidak diperlukan.",
+        "sub_drivers": "Deteksi perangkat keras dan instal driver grafis, Wi-Fi, firmware dan periferal.",
+        "sub_network": "Diagnostik, DNS, firewall, akses jarak jauh dan alat alamat MAC.",
+        "sub_tweaks": "Tweak performa, keamanan dan kenyamanan serta alat diagnostik.",
+        "sub_customizer": "Kustomisasi GRUB, splash boot Plymouth dan layar login.",
+        "sub_about": "Informasi versi, pengaturan dan masukan.",
+        "sub_license": "Lisensi, merek dagang dan pengungkapan.",
+        "run_selected": "Jalankan Pilihan", "refresh": "Muat Ulang", "select_all": "Pilih Semua", "clear": "Kosongkan",
+        "search": "Cari", "language": "Bahasa", "theme": "Tema", "light": "Terang", "dark": "Gelap",
+        "ready": "Siap", "terminal_opened": "Terminal dibuka", "nothing_selected": "Tidak ada yang dipilih.",
+        "installed": "terpasang", "recommended": "disarankan", "loading": "Memuat...",
+    },
+    "pt": {
+        "sec_overview": "VISÃO GERAL", "sec_maintenance": "MANUTENÇÃO", "sec_software": "SOFTWARE",
+        "sec_system": "SISTEMA", "sec_info": "INFO",
+        "nav_dashboard": "Painel", "nav_clean": "Limpar Sistema", "nav_repair": "Reparar APT e Chaves",
+        "nav_release": "Atualizações e Versão", "nav_sources": "Fontes APT", "nav_install": "Instalar Software",
+        "nav_uninstall": "Desinstalar Software", "nav_desktops": "Ambientes e WMs", "nav_kernels": "Kernels",
+        "nav_drivers": "Controladores e Hardware", "nav_network": "Rede", "nav_tweaks": "Ajustes e Ferramentas",
+        "nav_customizer": "Personalizador", "nav_about": "Sobre e Comentários", "nav_license": "Licença",
+        "sub_dashboard": "Resumo do sistema e manutenção com um clique.",
+        "sub_clean": "Liberte espaço em disco com segurança. Cada ação é mostrada num terminal.",
+        "sub_repair": "Corrija instalações interrompidas, dependências quebradas, fontes duplicadas e chaves GPG.",
+        "sub_release": "Mantenha o sistema atualizado e mude entre Debian Stable, Testing e Sid.",
+        "sub_sources": "Veja e edite ficheiros de repositórios APT. É feita uma cópia antes de guardar.",
+        "sub_install": "Instale aplicações do Debian, de repositórios oficiais ou do Flathub.",
+        "sub_uninstall": "Remova aplicações instaladas (APT e Flatpak).",
+        "sub_desktops": "Instale, troque ou remova ambientes de trabalho e gestores de janelas.",
+        "sub_kernels": "Instale kernels otimizados ou remova kernels desnecessários.",
+        "sub_drivers": "Detete hardware e instale controladores gráficos, Wi-Fi, firmware e periféricos.",
+        "sub_network": "Diagnóstico, DNS, firewall, acesso remoto e endereço MAC.",
+        "sub_tweaks": "Ajustes de desempenho, segurança e conveniência e ferramentas de diagnóstico.",
+        "sub_customizer": "Personalize o GRUB, o ecrã de arranque Plymouth e o ecrã de login.",
+        "sub_about": "Informação da versão, definições e comentários.",
+        "sub_license": "Licença, marcas registadas e avisos.",
+        "run_selected": "Executar Seleção", "refresh": "Atualizar", "select_all": "Selecionar Tudo", "clear": "Limpar",
+        "search": "Pesquisar", "language": "Idioma", "theme": "Tema", "light": "Claro", "dark": "Escuro",
+        "ready": "Pronto", "terminal_opened": "Terminal aberto", "nothing_selected": "Nada selecionado.",
+        "installed": "instalado", "recommended": "recomendado", "loading": "A carregar...",
+    },
+}
+
+NAV = [
+    ("sec_overview", ["dashboard"]),
+    ("sec_maintenance", ["clean", "repair", "release", "sources"]),
+    ("sec_software", ["install", "uninstall", "desktops"]),
+    ("sec_system", ["kernels", "drivers", "network", "tweaks", "customizer"]),
+    ("sec_info", ["about", "license"]),
+]
+
+PALETTES = {
+    "light": {
+        "bg": "#F3F4F6", "surface": "#FFFFFF", "surface2": "#F9FAFB", "border": "#E5E7EB",
+        "text": "#111827", "muted": "#6B7280", "accent": "#C70036", "accent_hover": "#A3002C",
+        "accent_fg": "#FFFFFF", "sidebar": "#111827", "sidebar_fg": "#D1D5DB", "sidebar_muted": "#6B7280",
+        "sidebar_hover": "#1F2937", "sidebar_active": "#273449", "secondary": "#E5E7EB",
+        "secondary_hover": "#D1D5DB", "danger": "#DC2626", "danger_hover": "#B91C1C", "success": "#15803D",
+        "warning": "#B45309", "info": "#1D4ED8", "input": "#FFFFFF", "select": "#FDE2EA",
+    },
+    "dark": {
+        "bg": "#0F141B", "surface": "#18202B", "surface2": "#1E2734", "border": "#2A3442",
+        "text": "#E5E7EB", "muted": "#94A3B8", "accent": "#E11D58", "accent_hover": "#BE123C",
+        "accent_fg": "#FFFFFF", "sidebar": "#0B1016", "sidebar_fg": "#CBD5E1", "sidebar_muted": "#64748B",
+        "sidebar_hover": "#151C26", "sidebar_active": "#1F2937", "secondary": "#2A3442",
+        "secondary_hover": "#364253", "danger": "#EF4444", "danger_hover": "#DC2626", "success": "#22C55E",
+        "warning": "#F59E0B", "info": "#60A5FA", "input": "#111821", "select": "#3B1424",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Data: kernels, desktops, window managers, software catalogue
+# ---------------------------------------------------------------------------
+KERNELS = [
+    # key, title, description, x86 level required (0 = any)
+    ("debian_backports", "🐧 Debian Backports Kernel", "Newer official Debian kernel from <stable>-backports (Stable only). Signed for Secure Boot.", 0),
+    ("xanmod-x64v2", "⚙️ XanMod MAIN (x64v2)", "For CPUs from ~2009-2013 (Nehalem, Bulldozer).", 2),
+    ("xanmod-x64v3", "⚙️ XanMod MAIN (x64v3)", "For modern CPUs (Haswell+, Zen 1-3).", 3),
+    ("xanmod-x64v4", "⚙️ XanMod MAIN (x64v4)", "For AVX-512 CPUs (Skylake-X, Ice Lake, Zen 4+).", 4),
+    ("xanmod-edge-x64v3", "🚀 XanMod EDGE (x64v3)", "Latest mainline-based XanMod for modern CPUs.", 3),
+    ("xanmod-lts-x64v3", "🛡️ XanMod LTS (x64v3)", "Long Term Support XanMod for modern CPUs.", 3),
+    ("xanmod-rt-x64v3", "⏱️ XanMod RT (x64v3)", "Real-time (PREEMPT_RT) XanMod for audio / low-latency work.", 3),
+    ("liquorix", "🎮 Liquorix Kernel", "Optimized for desktop, multimedia and gaming (amd64).", 0),
+    ("linux-libre", "🕊️ Linux-libre (FSFLA freesh)", "100% Free Software kernel without binary blobs.", 0),
+    ("mainline_stable", "🔧 Compile Linux Mainline (Stable)", "Download the latest stable kernel from kernel.org and build .deb packages (slow, ~10 GB).", 0),
+    ("mainline_longterm", "🔧 Compile Linux Mainline (Longterm)", "Download the newest longterm kernel from kernel.org and build .deb packages (slow, ~10 GB).", 0),
+]
+
+DE_COMMANDS = {
+    "GNOME": {"desc": "Modern and intuitive.", "full": "task-gnome-desktop", "minimal": "gnome-core", "core": "gnome-session gdm3", "rm": "^gnome|^gdm3|^task-gnome"},
+    "KDE Plasma": {"desc": "Highly customizable desktop.", "full": "task-kde-desktop", "minimal": "kde-plasma-desktop", "core": "plasma-desktop sddm", "rm": "^kde-|^plasma-|^sddm|^task-kde"},
+    "XFCE": {"desc": "Fast and resource-friendly.", "full": "task-xfce-desktop", "minimal": "xfce4", "core": "xfce4-session lightdm", "rm": "^xfce4|^thunar|^task-xfce"},
+    "Cinnamon": {"desc": "Traditional, elegant desktop.", "full": "task-cinnamon-desktop", "minimal": "cinnamon-core", "core": "cinnamon lightdm", "rm": "^cinnamon|^nemo|^muffin|^task-cinnamon"},
+    "MATE": {"desc": "Classic GNOME 2 fork.", "full": "task-mate-desktop", "minimal": "mate-desktop-environment-core", "core": "mate-session-manager lightdm", "rm": "^mate-|^caja|^task-mate"},
+    "LXQt": {"desc": "Lightweight Qt environment.", "full": "task-lxqt-desktop", "minimal": "lxqt-core", "core": "lxqt-session sddm", "rm": "^lxqt|^pcmanfm-qt|^task-lxqt"},
+    "LXDE": {"desc": "Extremely light desktop.", "full": "task-lxde-desktop", "minimal": "lxde-core", "core": "lxsession lightdm", "rm": "^lxde|^lxsession|^task-lxde"},
+    "Budgie": {"desc": "Sleek, modern desktop.", "full": "budgie-desktop-environment", "minimal": "budgie-desktop", "core": "budgie-desktop lightdm", "rm": "^budgie"},
+}
+
+WM_COMMANDS = {
+    "i3": {"desc": "Tiling WM for X11.", "pkgs": "i3 i3status dmenu xinit xterm pcmanfm papirus-icon-theme", "rm": "^i3$|^i3-wm|^i3status"},
+    "sway": {"desc": "i3-compatible Wayland compositor.", "pkgs": "sway swaybg swayidle swaylock foot wofi waybar papirus-icon-theme", "rm": "^sway|^waybar|^wofi"},
+    "bspwm": {"desc": "Binary space partitioning WM.", "pkgs": "bspwm sxhkd xinit xterm pcmanfm papirus-icon-theme", "rm": "^bspwm|^sxhkd"},
+    "openbox": {"desc": "Highly configurable floating WM.", "pkgs": "openbox obconf tint2 xinit xterm pcmanfm papirus-icon-theme", "rm": "^openbox|^obconf|^tint2"},
+    "awesome": {"desc": "Dynamic WM configured in Lua.", "pkgs": "awesome awesome-extra xinit xterm pcmanfm", "rm": "^awesome"},
+    "icewm": {"desc": "Windows-like, very light.", "pkgs": "icewm xinit xterm pcmanfm", "rm": "^icewm"},
+    "jwm": {"desc": "Joe's Window Manager, tiny.", "pkgs": "jwm xinit xterm pcmanfm papirus-icon-theme", "rm": "^jwm"},
+    "qtile": {"desc": "Python tiling WM (installed in /opt/qtile venv).", "pkgs": None, "rm": None},
+}
+
+# key: (icon, name, description, category, check package, recipe lines)
+# Recipes are bash snippets that rely on the helper functions in SCRIPT_HELPERS.
+CATS = ["Browsers", "Multimedia", "Graphics", "Office & Internet", "Development", "System & Security", "Gaming"]
+
+
+def apt_recipe(*pkgs):
+    return [f"apt_install {' '.join(pkgs)}"]
+
+
+SOFTWARE = {
+    # Browsers
+    "firefox": ("🦊", "Mozilla Firefox (latest)", "Rapid-release Firefox from Mozilla's official APT repository.", "Browsers", "firefox", [
+        "install -d -m 0755 /etc/apt/keyrings",
+        "curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg -o /etc/apt/keyrings/packages.mozilla.org.asc",
+        "echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' > /etc/apt/sources.list.d/mozilla.list",
+        "printf 'Package: *\\nPin: origin packages.mozilla.org\\nPin-Priority: 1000\\n' > /etc/apt/preferences.d/mozilla",
+        "apt_update", "apt_install firefox"]),
+    "firefox-esr": ("🦊", "Firefox ESR", "Debian's default extended-support Firefox.", "Browsers", "firefox-esr", apt_recipe("firefox-esr")),
+    "chromium": ("🌐", "Chromium", "Open-source base of Google Chrome (Debian package).", "Browsers", "chromium", apt_recipe("chromium")),
+    "chrome": ("🌐", "Google Chrome", "Google's browser (amd64).", "Browsers", "google-chrome-stable", [
+        "need_arch amd64 && { wget -qO /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && apt_install /tmp/chrome.deb; rm -f /tmp/chrome.deb; }"]),
+    "edge": ("🌐", "Microsoft Edge", "Microsoft's Chromium browser (amd64).", "Browsers", "microsoft-edge-stable", [
+        "need_arch amd64 && { add_key https://packages.microsoft.com/keys/microsoft.asc /usr/share/keyrings/microsoft-edge.gpg && "
+        "echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-edge.gpg] https://packages.microsoft.com/repos/edge stable main' > /etc/apt/sources.list.d/microsoft-edge.list && "
+        "apt_update && apt_install microsoft-edge-stable; }"]),
+    "brave": ("🦁", "Brave Browser", "Privacy-focused browser (official installer).", "Browsers", "brave-browser", [
+        "curl -fsS https://dl.brave.com/install.sh | sh"]),
+    "vivaldi": ("🔴", "Vivaldi", "Feature-rich, customizable browser.", "Browsers", "vivaldi-stable", [
+        "add_key https://repo.vivaldi.com/archive/linux_signing_key.pub /usr/share/keyrings/vivaldi.gpg && "
+        "echo 'deb [signed-by=/usr/share/keyrings/vivaldi.gpg] https://repo.vivaldi.com/archive/deb/ stable main' > /etc/apt/sources.list.d/vivaldi-archive.list && "
+        "apt_update && apt_install vivaldi-stable"]),
+    "opera": ("🔴", "Opera", "Browser with built-in free VPN.", "Browsers", "opera-stable", [
+        "echo 'opera-stable opera-stable/add-deb-source boolean false' | debconf-set-selections",
+        "add_key https://deb.opera.com/archive.key /usr/share/keyrings/opera-browser.gpg && "
+        "echo 'deb [signed-by=/usr/share/keyrings/opera-browser.gpg] https://deb.opera.com/opera-stable/ stable non-free' > /etc/apt/sources.list.d/opera-archive.list && "
+        "apt_update && apt_install opera-stable"]),
+    "librewolf": ("🐺", "LibreWolf", "Privacy-hardened Firefox fork (via extrepo).", "Browsers", "librewolf", [
+        "ensure_pkg extrepo && extrepo enable librewolf && apt_update && apt_install librewolf"]),
+    "floorp": ("🌍", "Floorp", "Customizable Firefox-based browser.", "Browsers", "floorp", [
+        "add_key https://ppa.floorp.app/KEY.gpg /usr/share/keyrings/Floorp.gpg && "
+        "curl -fsSL --compressed -o /etc/apt/sources.list.d/Floorp.list https://ppa.floorp.app/Floorp.list && "
+        "apt_update && apt_install floorp"]),
+    "torbrowser": ("🧅", "Tor Browser Launcher", "Downloads and verifies the Tor Browser (contrib).", "Browsers", "torbrowser-launcher", [
+        "enable_components", "apt_update", "apt_install torbrowser-launcher"]),
+    # Multimedia
+    "codecs": ("⚙️", "Multimedia Codecs", "FFmpeg, GStreamer good/bad/ugly/libav, extra codecs.", "Multimedia", "libavcodec-extra", [
+        "apt_install libavcodec-extra ffmpeg gstreamer1.0-libav gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-vaapi"]),
+    "vlc": ("▶️", "VLC", "Plays almost every media format.", "Multimedia", "vlc", apt_recipe("vlc")),
+    "mpv": ("🎞️", "Celluloid (mpv)", "Simple GTK front-end for mpv.", "Multimedia", "celluloid", apt_recipe("celluloid")),
+    "smplayer": ("🎬", "SMPlayer", "Media player with many features.", "Multimedia", "smplayer", apt_recipe("smplayer")),
+    "audacious": ("🎵", "Audacious", "Lightweight audio player.", "Multimedia", "audacious", apt_recipe("audacious")),
+    "rhythmbox": ("🎶", "Rhythmbox", "Music library manager.", "Multimedia", "rhythmbox", apt_recipe("rhythmbox")),
+    "audacity": ("🎙️", "Audacity", "Audio recorder and editor.", "Multimedia", "audacity", apt_recipe("audacity")),
+    "kdenlive": ("✂️", "Kdenlive", "Professional video editor.", "Multimedia", "kdenlive", apt_recipe("kdenlive")),
+    "openshot": ("✂️", "OpenShot", "Easy video editor.", "Multimedia", "openshot-qt", apt_recipe("openshot-qt")),
+    "obs": ("🎥", "OBS Studio", "Screen recording and live streaming.", "Multimedia", "obs-studio", apt_recipe("obs-studio")),
+    "handbrake": ("🔄", "HandBrake", "Video transcoder.", "Multimedia", "handbrake", apt_recipe("handbrake")),
+    # Graphics
+    "gimp": ("🖌️", "GIMP", "Advanced image editor.", "Graphics", "gimp", apt_recipe("gimp")),
+    "inkscape": ("✒️", "Inkscape", "Vector graphics editor.", "Graphics", "inkscape", apt_recipe("inkscape")),
+    "krita": ("🎨", "Krita", "Digital painting.", "Graphics", "krita", apt_recipe("krita")),
+    "blender": ("🧊", "Blender", "3D creation suite.", "Graphics", "blender", apt_recipe("blender")),
+    "darktable": ("📷", "Darktable", "RAW photo workflow.", "Graphics", "darktable", apt_recipe("darktable")),
+    "googleearth": ("🌎", "Google Earth Pro", "3D globe (amd64).", "Graphics", "google-earth-pro-stable", [
+        "need_arch amd64 && { wget -qO /tmp/google-earth.deb https://dl.google.com/dl/earth/client/current/google-earth-pro-stable_current_amd64.deb && apt_install /tmp/google-earth.deb; rm -f /tmp/google-earth.deb; }"]),
+    # Office & Internet
+    "libreoffice": ("📝", "LibreOffice", "Full office suite (Debian package).", "Office & Internet", "libreoffice-writer", apt_recipe("libreoffice", "libreoffice-gtk3")),
+    "onlyoffice": ("📊", "ONLYOFFICE Desktop", "MS Office-compatible office suite.", "Office & Internet", "onlyoffice-desktopeditors", [
+        "add_key https://download.onlyoffice.com/GPG-KEY-ONLYOFFICE /usr/share/keyrings/onlyoffice.gpg && "
+        "echo 'deb [signed-by=/usr/share/keyrings/onlyoffice.gpg] https://download.onlyoffice.com/repo/debian squeeze main' > /etc/apt/sources.list.d/onlyoffice.list && "
+        "apt_update && apt_install onlyoffice-desktopeditors"]),
+    "thunderbird": ("📧", "Thunderbird", "Email client.", "Office & Internet", "thunderbird", apt_recipe("thunderbird")),
+    "telegram": ("💬", "Telegram Desktop", "Messaging app (Debian package).", "Office & Internet", "telegram-desktop", apt_recipe("telegram-desktop")),
+    "discord": ("🎮", "Discord", "Voice and text chat (amd64).", "Office & Internet", "discord", [
+        "need_arch amd64 && { wget -qO /tmp/discord.deb 'https://discord.com/api/download?platform=linux&format=deb' && apt_install /tmp/discord.deb; rm -f /tmp/discord.deb; }"]),
+    "transmission": ("⬇️", "Transmission", "Simple BitTorrent client.", "Office & Internet", "transmission-gtk", apt_recipe("transmission-gtk")),
+    "qbittorrent": ("⬇️", "qBittorrent", "Feature-rich BitTorrent client.", "Office & Internet", "qbittorrent", apt_recipe("qbittorrent")),
+    "remmina": ("🖥️", "Remmina", "Remote desktop client (RDP, VNC, SSH).", "Office & Internet", "remmina", apt_recipe("remmina", "remmina-plugin-rdp", "remmina-plugin-vnc")),
+    # Development
+    "devtools": ("🧰", "Developer Essentials", "build-essential, git, curl, wget, make, pkg-config.", "Development", "build-essential", apt_recipe("build-essential", "git", "curl", "wget", "pkg-config", "make")),
+    "vscode": ("💻", "Visual Studio Code", "Microsoft's code editor (official repository).", "Development", "code", [
+        "echo 'code code/add-microsoft-repo boolean false' | debconf-set-selections",
+        "add_key https://packages.microsoft.com/keys/microsoft.asc /usr/share/keyrings/microsoft-vscode.gpg && "
+        "echo 'deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-vscode.gpg] https://packages.microsoft.com/repos/code stable main' > /etc/apt/sources.list.d/vscode.list && "
+        "apt_update && apt_install code"]),
+    "vscodium": ("💻", "VSCodium", "VS Code without Microsoft telemetry.", "Development", "codium", [
+        "add_key https://gitlab.com/paulcarroty/vscodium-deb-rpm-repo/raw/master/pub.gpg /usr/share/keyrings/vscodium-archive-keyring.gpg && "
+        "echo 'deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/vscodium-archive-keyring.gpg] https://download.vscodium.com/debs vscodium main' > /etc/apt/sources.list.d/vscodium.list && "
+        "apt_update && apt_install codium"]),
+    "docker": ("🐳", "Docker Engine", "Official Docker CE + Compose + Buildx; adds you to the docker group.", "Development", "docker-ce", [
+        "apt-get remove -y docker.io docker-doc docker-compose podman-docker containerd runc 2>/dev/null || true",
+        "ensure_pkg ca-certificates curl",
+        "install -m 0755 -d /etc/apt/keyrings",
+        "curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc",
+        "rm -f /etc/apt/sources.list.d/docker.list",
+        "printf 'Types: deb\\nURIs: https://download.docker.com/linux/debian\\nSuites: %s\\nComponents: stable\\nSigned-By: /etc/apt/keyrings/docker.asc\\n' \"$REPO_CODENAME\" > /etc/apt/sources.list.d/docker.sources",
+        "apt_update",
+        "apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && usermod -aG docker \"$TARGET_USER\""]),
+    "virtualbox": ("💽", "VirtualBox", "Oracle VirtualBox from the official repository (amd64).", "Development", "virtualbox-7.2", [
+        "need_arch amd64 && { add_key https://www.virtualbox.org/download/oracle_vbox_2016.asc /usr/share/keyrings/oracle-virtualbox-2016.gpg && "
+        "echo \"deb [arch=amd64 signed-by=/usr/share/keyrings/oracle-virtualbox-2016.gpg] https://download.virtualbox.org/virtualbox/debian $REPO_CODENAME contrib\" > /etc/apt/sources.list.d/virtualbox.list && "
+        "apt_update && VB=$(apt-cache pkgnames virtualbox- | grep -E '^virtualbox-[0-9.]+$' | sort -V | tail -n1) && "
+        "apt_install dkms \"linux-headers-$(uname -r)\" \"$VB\" && usermod -aG vboxusers \"$TARGET_USER\"; }"]),
+    "virtmanager": ("🖧", "Virt-Manager (KVM/QEMU)", "Native Linux virtualization; adds you to the libvirt group.", "Development", "virt-manager", [
+        "apt_install virt-manager qemu-system libvirt-daemon-system && usermod -aG libvirt \"$TARGET_USER\" && systemctl enable --now libvirtd"]),
+    # System & Security
+    "ufw": ("🧱", "UFW + Gufw Firewall", "Simple firewall with graphical front-end.", "System & Security", "gufw", apt_recipe("ufw", "gufw")),
+    "clamtk": ("🦠", "ClamTk Antivirus", "ClamAV scanner with GUI.", "System & Security", "clamtk", apt_recipe("clamav", "clamav-freshclam", "clamtk")),
+    "keepassxc": ("🔐", "KeePassXC", "Offline password manager.", "System & Security", "keepassxc", apt_recipe("keepassxc")),
+    "timeshift": ("⏪", "Timeshift", "System snapshots and restore.", "System & Security", "timeshift", apt_recipe("timeshift")),
+    "bleachbit": ("🧽", "BleachBit", "Advanced privacy cleaner.", "System & Security", "bleachbit", apt_recipe("bleachbit")),
+    "gparted": ("🗄️", "GParted", "Partition editor.", "System & Security", "gparted", apt_recipe("gparted")),
+    "synaptic": ("📦", "Synaptic", "Classic graphical package manager.", "System & Security", "synaptic", apt_recipe("synaptic")),
+    "diskutil": ("💾", "GNOME Disks", "Disk management and benchmarking.", "System & Security", "gnome-disk-utility", apt_recipe("gnome-disk-utility")),
+    "monitor": ("📈", "btop + htop", "Terminal system monitors.", "System & Security", "btop", apt_recipe("btop", "htop")),
+    # Gaming
+    "steam": ("🚂", "Steam", "Valve's gaming platform (enables contrib/non-free and i386).", "Gaming", "steam-installer", [
+        "enable_components", "dpkg --add-architecture i386", "apt_update",
+        "apt_install steam-installer mesa-vulkan-drivers libglx-mesa0:i386 mesa-vulkan-drivers:i386 libgl1-mesa-dri:i386"]),
+    "wine": ("🍷", "WineHQ (stable)", "Run Windows applications (official WineHQ repository).", "Gaming", "winehq-stable", [
+        "dpkg --add-architecture i386",
+        "install -d -m 0755 /etc/apt/keyrings",
+        "wget -qO /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key",
+        "wget -qO \"/etc/apt/sources.list.d/winehq-$REPO_CODENAME.sources\" \"https://dl.winehq.org/wine-builds/debian/dists/$REPO_CODENAME/winehq-$REPO_CODENAME.sources\"",
+        "apt_update", "apt_install --install-recommends winehq-stable"]),
+    "lutris": ("🕹️", "Lutris", "Open gaming platform.", "Gaming", "lutris", apt_recipe("lutris")),
+    "gamemode": ("🚀", "GameMode + MangoHud", "Performance daemon and FPS overlay.", "Gaming", "gamemode", apt_recipe("gamemode", "mangohud")),
+}
+
+FLATPAKS = [
+    # id, icon, name, description, category
+    ("org.mozilla.firefox", "🦊", "Firefox", "Mozilla's browser.", "Browsers"),
+    ("com.brave.Browser", "🦁", "Brave", "Privacy browser.", "Browsers"),
+    ("app.zen_browser.zen", "🦊", "Zen Browser", "Calm, Firefox-based browser.", "Browsers"),
+    ("net.waterfox.waterfox", "🦊", "Waterfox", "Firefox fork.", "Browsers"),
+    ("io.github.ungoogled_software.ungoogled_chromium", "🌐", "Ungoogled Chromium", "Chromium without Google.", "Browsers"),
+    ("org.videolan.VLC", "▶️", "VLC", "Media player.", "Multimedia"),
+    ("com.spotify.Client", "🎧", "Spotify", "Music streaming.", "Multimedia"),
+    ("com.obsproject.Studio", "🎥", "OBS Studio", "Live streaming.", "Multimedia"),
+    ("org.kde.kdenlive", "✂️", "Kdenlive", "Video editor.", "Multimedia"),
+    ("org.blender.Blender", "🧊", "Blender", "3D creation.", "Graphics"),
+    ("org.gimp.GIMP", "🖌️", "GIMP", "Image editor.", "Graphics"),
+    ("org.libreoffice.LibreOffice", "📝", "LibreOffice", "Office suite.", "Office & Internet"),
+    ("org.onlyoffice.desktopeditors", "📊", "ONLYOFFICE", "Office suite.", "Office & Internet"),
+    ("md.obsidian.Obsidian", "🗒️", "Obsidian", "Markdown knowledge base.", "Office & Internet"),
+    ("org.telegram.desktop", "💬", "Telegram", "Messaging.", "Office & Internet"),
+    ("org.signal.Signal", "🔒", "Signal", "Private messenger.", "Office & Internet"),
+    ("com.discordapp.Discord", "🎮", "Discord", "Voice & chat.", "Office & Internet"),
+    ("com.slack.Slack", "💼", "Slack", "Team chat.", "Office & Internet"),
+    ("us.zoom.Zoom", "📹", "Zoom", "Video meetings.", "Office & Internet"),
+    ("ro.go.hmlendea.DL-Desktop", "🦉", "Duolingo Desktop", "Language learning.", "Office & Internet"),
+    ("app.drey.Dialect", "🗣️", "Dialect", "Translation app.", "Office & Internet"),
+    ("com.github.hugolabe.Wike", "📖", "Wike", "Wikipedia reader.", "Office & Internet"),
+    ("com.visualstudio.code", "💻", "VS Code", "Code editor.", "Development"),
+    ("com.github.tchx84.Flatseal", "🛡️", "Flatseal", "Manage Flatpak permissions.", "System & Security"),
+    ("io.missioncenter.MissionCenter", "📈", "Mission Center", "Task manager.", "System & Security"),
+    ("com.valvesoftware.Steam", "🚂", "Steam", "Gaming platform.", "Gaming"),
+    ("com.heroicgameslauncher.hgl", "🕹️", "Heroic Games Launcher", "Epic, GOG & Amazon games.", "Gaming"),
+    ("com.usebottles.bottles", "🍾", "Bottles", "Run Windows software.", "Gaming"),
+    ("net.davidotek.pupgui2", "🧪", "ProtonUp-Qt", "Manage Proton-GE / Wine-GE.", "Gaming"),
+]
+
+DNS_PRESETS = {
+    "Automatic (DHCP)": ("", ""),
+    "Cloudflare": ("1.1.1.1 1.0.0.1", "2606:4700:4700::1111 2606:4700:4700::1001"),
+    "Google": ("8.8.8.8 8.8.4.4", "2001:4860:4860::8888 2001:4860:4860::8844"),
+    "Quad9 (malware blocking)": ("9.9.9.9 149.112.112.112", "2620:fe::fe 2620:fe::9"),
+    "AdGuard (ad blocking)": ("94.140.14.14 94.140.15.15", "2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"),
+    "OpenDNS": ("208.67.222.222 208.67.220.220", "2620:119:35::35 2620:119:53::53"),
+}
+
+# ---------------------------------------------------------------------------
+# Bash helpers that are embedded at the top of every generated script
+# ---------------------------------------------------------------------------
+SCRIPT_HELPERS = r'''
+set -E
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+FAILED=0
+LOG_FILE=/var/log/debos-toolbox.log
+if touch "$LOG_FILE" 2>/dev/null; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
+step() { echo -e "\n\e[1;34m==> $*\e[0m"; }
+ok()   { echo -e "\e[1;32m[ OK ]\e[0m $*"; }
+warn() { echo -e "\e[1;33m[WARN]\e[0m $*"; }
+fail() { echo -e "\e[1;31m[FAIL]\e[0m $*"; FAILED=$((FAILED + 1)); }
+trap 'rc=$?; fail "\"$BASH_COMMAND\" exited with code $rc"' ERR
+apt_update()  { apt-get update || warn "apt-get update reported problems (see above)."; }
+apt_install() { apt-get install -y "$@"; }
+is_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'; }
+ensure_pkg() {
+    local p missing=()
+    for p in "$@"; do is_installed "$p" || missing+=("$p"); done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    apt-get install -y "${missing[@]}"
+}
+add_key() {  # add_key <url> <destination .gpg>
+    install -d -m 0755 "$(dirname "$2")"
+    curl -fsSL "$1" | gpg --dearmor --yes -o "$2" && chmod 0644 "$2"
+}
+need_arch() {
+    [ "$ARCH" = "$1" ] && return 0
+    warn "This item is only available for $1 (this system is $ARCH) - skipped."
+    return 1
+}
+enable_components() {
+    step "Enabling contrib, non-free and non-free-firmware components"
+    local f
+    if [ -f /etc/apt/sources.list ]; then
+        sed -i -E '/^[[:space:]]*deb(-src)?[[:space:]].*(debian\.org|\/debian(-security)?\/?[[:space:]])/ {
+            / contrib( |$)/! s/ main( |$)/ main contrib\1/
+            / non-free( |$)/! s/ contrib( |$)/ contrib non-free\1/
+            / non-free-firmware( |$)/! s/ non-free( |$)/ non-free non-free-firmware\1/
+        }' /etc/apt/sources.list
+    fi
+    for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        case "$f" in
+            *.sources)
+                grep -qE '^URIs:.*debian\.org|debian-archive-keyring' "$f" || continue
+                sed -i -E '/^Components:/ {
+                    / contrib( |$)/! s/$/ contrib/
+                    / non-free( |$)/! s/$/ non-free/
+                    / non-free-firmware( |$)/! s/$/ non-free-firmware/
+                }' "$f" ;;
+            *.list)
+                sed -i -E '/^[[:space:]]*deb(-src)?[[:space:]].*debian\.org.*[[:space:]]main/ {
+                    / contrib( |$)/! s/ main( |$)/ main contrib\1/
+                    / non-free( |$)/! s/ contrib( |$)/ contrib non-free\1/
+                    / non-free-firmware( |$)/! s/ non-free( |$)/ non-free non-free-firmware\1/
+                }' "$f" ;;
+        esac
+    done
+    ok "Components enabled."
+}
+backup_apt_sources() {
+    local dest="/var/backups/debos-toolbox/apt-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$dest"
+    cp -a /etc/apt/sources.list /etc/apt/sources.list.d "$dest"/ 2>/dev/null || true
+    ok "APT sources backed up to $dest"
+}
+'''
+
+SCRIPT_FOOTER = r'''
+trap - ERR
+echo
+if [ "$FAILED" -gt 0 ]; then
+    echo -e "\e[1;31m[!] Finished with $FAILED problem(s). Review the output above or $LOG_FILE\e[0m"
+else
+    echo -e "\e[1;32m[✓] All tasks finished successfully.\e[0m"
+fi
+'''
+
+
+# ---------------------------------------------------------------------------
+# The GUI
+# ---------------------------------------------------------------------------
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog, font as tkfont
+except ImportError:  # --version / --startup still work; main() explains how to fix it
+    tk = None
+
+try:
+    from PIL import Image, ImageTk
+except Exception:  # Pillow is optional; images are simply skipped
+    Image = ImageTk = None
+
+
+def load_settings():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_settings(data):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        pass
+
+
+class DebosToolbox:
+    def __init__(self, root):
+        self.root = root
+        self.settings = load_settings()
+        self.lang = self.settings.get("language", "en")
+        if self.lang not in STRINGS:
+            self.lang = "en"
+        self.theme = self.settings.get("theme", "light")
+        if self.theme not in PALETTES:
+            self.theme = "light"
+        self.sys = detect_system()
+        self.user, self.home = target_user()
+        self.cpu_level = cpu_x86_level()
+        self.secure_boot = secure_boot_enabled()
+        self.images = {}
+        self.current_page = "dashboard"
+        self.status_var = tk.StringVar()
+        self.results = queue.Queue()
+
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
+        self.root.geometry("1220x800")
+        self.root.minsize(1000, 640)
+        self.setup_fonts()
+        self.set_window_icon()
+        self.build_ui()
+        self.poll_results()
+        if not self.sys["has_apt"]:
+            self.root.after(400, lambda: messagebox.showwarning(
+                APP_NAME, "APT was not found. Debos - Toolbox is designed for Debian (Stable, Testing, Sid) and LMDE; most actions will not work on this system."))
+
+    # ----- helpers --------------------------------------------------------
+    def t(self, key):
+        return STRINGS.get(self.lang, {}).get(key) or STRINGS["en"].get(key, key)
+
+    @property
+    def P(self):
+        return PALETTES[self.theme]
+
+    def setup_fonts(self):
+        families = set(tkfont.families(self.root))
+        sans = next((f for f in ("Inter", "Cantarell", "Noto Sans", "Ubuntu", "DejaVu Sans", "Liberation Sans") if f in families), "TkDefaultFont")
+        mono = next((f for f in ("JetBrains Mono", "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono") if f in families), "TkFixedFont")
+        self.F = {
+            "body": (sans, 10), "small": (sans, 9), "bold": (sans, 10, "bold"),
+            "h1": (sans, 19, "bold"), "h2": (sans, 12, "bold"), "h3": (sans, 11, "bold"),
+            "nav": (sans, 10), "navsec": (sans, 8, "bold"), "brand": (sans, 15, "bold"),
+            "mono": (mono, 10), "stat": (sans, 15, "bold"),
+        }
+
+    def set_window_icon(self):
+        try:
+            if os.path.exists(ICON_PATH):
+                self._icon = tk.PhotoImage(file=ICON_PATH)
+                self.root.iconphoto(True, self._icon)
+        except Exception:
+            pass
+
+    def load_image(self, path, size):
+        key = (path, size)
+        if key in self.images:
+            return self.images[key]
+        if Image is None or not os.path.exists(path):
+            return None
+        try:
+            img = Image.open(path)
+            img.thumbnail(size)
+            self.images[key] = ImageTk.PhotoImage(img)
+            return self.images[key]
+        except Exception:
+            return None
+
+    def set_status(self, text):
+        self.status_var.set(text)
+
+    # ----- styles ----------------------------------------------------------
+    def apply_style(self):
+        P = self.P
+        st = ttk.Style(self.root)
+        if "clam" in st.theme_names():
+            st.theme_use("clam")
+        st.configure(".", background=P["surface"], foreground=P["text"], font=self.F["body"],
+                     fieldbackground=P["input"], bordercolor=P["border"], lightcolor=P["border"],
+                     darkcolor=P["border"], troughcolor=P["bg"], focuscolor=P["accent"])
+        for name in ("TCheckbutton", "TRadiobutton"):
+            st.configure(name, background=P["surface"], foreground=P["text"], font=self.F["body"],
+                         indicatorbackground=P["input"], indicatorforeground=P["accent"])
+            st.map(name, background=[("active", P["surface"])], foreground=[("disabled", P["muted"])],
+                   indicatorbackground=[("selected", P["accent"]), ("active", P["select"])],
+                   indicatorforeground=[("selected", "#FFFFFF")])
+        st.configure("Item.TCheckbutton", font=self.F["h3"])
+        st.configure("TEntry", fieldbackground=P["input"], foreground=P["text"], insertcolor=P["text"], padding=5)
+        st.configure("TCombobox", fieldbackground=P["input"], foreground=P["text"], background=P["surface"],
+                     arrowcolor=P["text"], padding=4)
+        st.map("TCombobox", fieldbackground=[("readonly", P["input"])], foreground=[("readonly", P["text"])],
+               selectbackground=[("readonly", P["input"])], selectforeground=[("readonly", P["text"])])
+        st.configure("TNotebook", background=P["bg"], borderwidth=0, tabmargins=(0, 4, 0, 0))
+        st.configure("TNotebook.Tab", background=P["secondary"], foreground=P["text"], padding=(16, 7), font=self.F["bold"], borderwidth=0)
+        st.map("TNotebook.Tab", background=[("selected", P["accent"])], foreground=[("selected", P["accent_fg"])])
+        st.configure("Vertical.TScrollbar", background=P["secondary"], troughcolor=P["bg"], arrowcolor=P["muted"], borderwidth=0)
+        st.map("Vertical.TScrollbar", background=[("active", P["secondary_hover"])])
+        self.root.option_add("*TCombobox*Listbox.background", P["input"])
+        self.root.option_add("*TCombobox*Listbox.foreground", P["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", P["accent"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", P["accent_fg"])
+        self.root.configure(bg=P["bg"])
+
+    # ----- layout ----------------------------------------------------------
+    def build_ui(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.apply_style()
+        P = self.P
+        self.pages, self.nav_buttons = {}, {}
+        self._install_scanned = self._hw_scanned = False
+
+        # Sidebar
+        side = tk.Frame(self.root, bg=P["sidebar"], width=232)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        brand = tk.Frame(side, bg=P["sidebar"])
+        brand.pack(fill="x", padx=18, pady=(18, 10))
+        logo = self.load_image(ICON_PATH, (34, 34))
+        if logo:
+            tk.Label(brand, image=logo, bg=P["sidebar"]).pack(side="left", padx=(0, 10))
+        bt = tk.Frame(brand, bg=P["sidebar"])
+        bt.pack(side="left")
+        tk.Label(bt, text="Debos", font=self.F["brand"], fg="#FFFFFF", bg=P["sidebar"]).pack(anchor="w")
+        tk.Label(bt, text=f"Toolbox  v{APP_VERSION}", font=self.F["small"], fg=P["sidebar_muted"], bg=P["sidebar"]).pack(anchor="w")
+        for sec, keys in NAV:
+            tk.Label(side, text=self.t(sec), font=self.F["navsec"], fg=P["sidebar_muted"], bg=P["sidebar"]).pack(anchor="w", padx=20, pady=(12, 2))
+            for key in keys:
+                self.make_nav_button(side, key)
+
+        # Main column
+        main = tk.Frame(self.root, bg=P["bg"])
+        main.pack(side="left", fill="both", expand=True)
+
+        top = tk.Frame(main, bg=P["surface"], highlightthickness=0)
+        top.pack(fill="x")
+        tk.Frame(main, bg=P["border"], height=1).pack(fill="x")
+        badge_color = {"sid": P["danger"], "testing": P["warning"], "stable": P["success"]}.get(self.sys["branch"], P["info"])
+        tk.Label(top, text="●", fg=badge_color, bg=P["surface"], font=self.F["h3"]).pack(side="left", padx=(22, 6), pady=12)
+        tk.Label(top, text=branch_badge(self.sys), fg=P["text"], bg=P["surface"], font=self.F["bold"]).pack(side="left", pady=12)
+        tk.Label(top, text=f"   ·   {self.sys['arch']}   ·   {self.user}", fg=P["muted"], bg=P["surface"], font=self.F["body"]).pack(side="left")
+
+        theme_txt = "☀  " + self.t("light") if self.theme == "dark" else "☾  " + self.t("dark")
+        self.button(top, theme_txt, self.toggle_theme, "secondary").pack(side="right", padx=(6, 18), pady=10)
+        self.lang_var = tk.StringVar(value=LANG_NAMES[self.lang])
+        cb = ttk.Combobox(top, textvariable=self.lang_var, values=list(LANG_NAMES.values()), state="readonly", width=17)
+        cb.pack(side="right", pady=10)
+        cb.bind("<<ComboboxSelected>>", self.change_language)
+        tk.Label(top, text=self.t("language") + ":", bg=P["surface"], fg=P["muted"], font=self.F["small"]).pack(side="right", padx=6)
+
+        status = tk.Frame(main, bg=P["surface"])
+        status.pack(side="bottom", fill="x")
+        tk.Frame(main, bg=P["border"], height=1).pack(side="bottom", fill="x")
+        self.status_var.set(self.t("ready"))
+        tk.Label(status, textvariable=self.status_var, bg=P["surface"], fg=P["muted"], font=self.F["small"], anchor="w").pack(side="left", padx=18, pady=5)
+        tk.Label(status, text=f"{APP_NAME} {APP_VERSION} (build {APP_BUILD})", bg=P["surface"], fg=P["muted"], font=self.F["small"]).pack(side="right", padx=18)
+
+        self.content = tk.Frame(main, bg=P["bg"])
+        self.content.pack(fill="both", expand=True, padx=26, pady=(18, 10))
+        self.show_page(self.current_page)
+
+    def make_nav_button(self, parent, key):
+        P = self.P
+        holder = tk.Frame(parent, bg=P["sidebar"])
+        holder.pack(fill="x", padx=10, pady=1)
+        bar = tk.Frame(holder, bg=P["sidebar"], width=3)
+        bar.pack(side="left", fill="y")
+        btn = tk.Label(holder, text=self.t("nav_" + key), font=self.F["nav"], fg=P["sidebar_fg"], bg=P["sidebar"],
+                       anchor="w", padx=12, pady=7, cursor="hand2")
+        btn.pack(side="left", fill="x", expand=True)
+        btn.bind("<Button-1>", lambda e, k=key: self.show_page(k))
+        btn.bind("<Enter>", lambda e, k=key: self.nav_hover(k, True))
+        btn.bind("<Leave>", lambda e, k=key: self.nav_hover(k, False))
+        self.nav_buttons[key] = (btn, bar)
+
+    def nav_hover(self, key, inside):
+        if key == self.current_page:
+            return
+        btn, _bar = self.nav_buttons[key]
+        btn.config(bg=self.P["sidebar_hover"] if inside else self.P["sidebar"])
+
+    def show_page(self, key):
+        P = self.P
+        self.current_page = key
+        for k, (btn, bar) in self.nav_buttons.items():
+            active = k == key
+            btn.config(bg=P["sidebar_active"] if active else P["sidebar"], fg="#FFFFFF" if active else P["sidebar_fg"],
+                       font=self.F["bold"] if active else self.F["nav"])
+            bar.config(bg=P["accent"] if active else P["sidebar"])
+        for page in self.pages.values():
+            page.pack_forget()
+        if key not in self.pages:
+            getattr(self, "page_" + key)()
+        self.pages[key].pack(fill="both", expand=True)
+        hook = getattr(self, "on_show_" + key, None)
+        if hook:
+            hook()
+
+    def change_language(self, _e=None):
+        rev = {v: k for k, v in LANG_NAMES.items()}
+        self.lang = rev.get(self.lang_var.get(), "en")
+        self.settings["language"] = self.lang
+        save_settings(self.settings)
+        self.build_ui()
+
+    def toggle_theme(self):
+        self.theme = "light" if self.theme == "dark" else "dark"
+        self.settings["theme"] = self.theme
+        save_settings(self.settings)
+        self.build_ui()
+
+    # ----- widgets ---------------------------------------------------------
+    def new_page(self, key, scroll=True):
+        P = self.P
+        outer = tk.Frame(self.content, bg=P["bg"])
+        self.pages[key] = outer
+        head = tk.Frame(outer, bg=P["bg"])
+        head.pack(fill="x", pady=(0, 12))
+        tk.Label(head, text=self.t("nav_" + key), font=self.F["h1"], fg=P["text"], bg=P["bg"]).pack(anchor="w")
+        tk.Label(head, text=self.t("sub_" + key), font=self.F["body"], fg=P["muted"], bg=P["bg"], justify="left", wraplength=850).pack(anchor="w", pady=(2, 0))
+        actions = tk.Frame(outer, bg=P["bg"])
+        actions.pack(side="bottom", fill="x", pady=(10, 0))
+        body = self.scroll_area(outer) if scroll else tk.Frame(outer, bg=P["bg"])
+        if not scroll:
+            body.pack(fill="both", expand=True)
+        return body, actions
+
+    def scroll_area(self, parent, bg=None):
+        bg = bg or self.P["bg"]
+        wrap = tk.Frame(parent, bg=bg)
+        wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(wrap, bg=bg, highlightthickness=0, bd=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=bg)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        def wheel(event):
+            if canvas.yview() == (0.0, 1.0):
+                return
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(3, "units")
+            elif event.delta:
+                canvas.yview_scroll(int(-event.delta / 40), "units")
+
+        def bind(_e):
+            canvas.bind_all("<Button-4>", wheel)
+            canvas.bind_all("<Button-5>", wheel)
+            canvas.bind_all("<MouseWheel>", wheel)
+
+        def unbind(_e):
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+            canvas.unbind_all("<MouseWheel>")
+
+        wrap.bind("<Enter>", bind)
+        wrap.bind("<Leave>", unbind)
+        inner.canvas = canvas
+        return inner
+
+    def card(self, parent, title=None, subtitle=None, side=None, expand=False):
+        P = self.P
+        outer = tk.Frame(parent, bg=P["surface"], highlightbackground=P["border"], highlightcolor=P["border"], highlightthickness=1)
+        if side:
+            outer.pack(side=side, fill="both", expand=expand, padx=(0, 12), pady=(0, 12))
+        else:
+            outer.pack(fill="x", pady=(0, 12), padx=(0, 6))
+        inner = tk.Frame(outer, bg=P["surface"])
+        inner.pack(fill="both", expand=True, padx=18, pady=14)
+        if title:
+            tk.Label(inner, text=title, font=self.F["h2"], fg=P["text"], bg=P["surface"]).pack(anchor="w")
+        if subtitle:
+            tk.Label(inner, text=subtitle, font=self.F["small"], fg=P["muted"], bg=P["surface"], justify="left", wraplength=820).pack(anchor="w", pady=(2, 8))
+        elif title:
+            tk.Frame(inner, bg=P["surface"], height=6).pack()
+        return inner
+
+    def button(self, parent, text, command, kind="primary"):
+        P = self.P
+        colors = {
+            "primary": (P["accent"], P["accent_fg"], P["accent_hover"]),
+            "secondary": (P["secondary"], P["text"], P["secondary_hover"]),
+            "danger": (P["danger"], "#FFFFFF", P["danger_hover"]),
+        }[kind]
+        b = tk.Button(parent, text=text, command=command, bg=colors[0], fg=colors[1], activebackground=colors[2],
+                      activeforeground=colors[1], relief="flat", bd=0, padx=14, pady=6, font=self.F["bold"],
+                      cursor="hand2", highlightthickness=0)
+        b.bind("<Enter>", lambda e: b.config(bg=colors[2]))
+        b.bind("<Leave>", lambda e: b.config(bg=colors[0]))
+        return b
+
+    def button_row(self, parent, buttons, bg=None):
+        row = tk.Frame(parent, bg=bg or self.P["surface"])
+        row.pack(fill="x", pady=(4, 2))
+        for spec in buttons:
+            text, cmd = spec[0], spec[1]
+            kind = spec[2] if len(spec) > 2 else "secondary"
+            self.button(row, text, cmd, kind).pack(side="left", padx=(0, 8), pady=3)
+        return row
+
+    def check(self, parent, var, text, desc=None, badges=(), style="TCheckbutton"):
+        P = self.P
+        row = tk.Frame(parent, bg=P["surface"])
+        row.pack(fill="x", pady=3)
+        line = tk.Frame(row, bg=P["surface"])
+        line.pack(fill="x")
+        ttk.Checkbutton(line, text=text, variable=var, style=style).pack(side="left")
+        for text_b, color in badges:
+            tk.Label(line, text=f" {text_b} ", font=self.F["small"], fg="#FFFFFF", bg=color).pack(side="left", padx=(8, 0))
+        if desc:
+            tk.Label(row, text=desc, font=self.F["small"], fg=P["muted"], bg=P["surface"], justify="left", wraplength=780).pack(anchor="w", padx=(26, 0))
+        return row
+
+    def label(self, parent, text, kind="body", fg=None, **kw):
+        P = self.P
+        lbl = tk.Label(parent, text=text, font=self.F[kind], fg=fg or P["text"], bg=kw.pop("bg", P["surface"]), justify="left", **kw)
+        return lbl
+
+    def entry(self, parent, var, width=30):
+        return ttk.Entry(parent, textvariable=var, width=width)
+
+    def text_box(self, parent, height=12, mono=True):
+        P = self.P
+        txt = tk.Text(parent, height=height, font=self.F["mono" if mono else "body"], bg=P["input"], fg=P["text"],
+                      insertbackground=P["text"], selectbackground=P["accent"], selectforeground="#FFFFFF",
+                      relief="flat", bd=0, highlightthickness=1, highlightbackground=P["border"], highlightcolor=P["accent"],
+                      padx=10, pady=8, wrap="none" if mono else "word", undo=True)
+        return txt
+
+    # ----- running privileged scripts --------------------------------------
+    def build_script(self, title, cmds, pause=True):
+        s = self.sys
+        header = "\n".join([
+            "#!/bin/bash",
+            f"# Generated by {APP_NAME} {APP_VERSION} - {title}",
+            f"TARGET_USER={shlex.quote(self.user)}",
+            f"TARGET_HOME={shlex.quote(self.home)}",
+            f"BRANCH={shlex.quote(s['branch'])}",
+            f"DEBIAN_CODENAME={shlex.quote(s['debian_codename'] or STABLE_CODENAME)}",
+            f"REPO_CODENAME={shlex.quote(s['repo_codename'])}",
+            f"STABLE_CODENAME={STABLE_CODENAME}",
+            "ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)",
+        ])
+        body = "\n".join(cmds)
+        banner = f"echo -e '\\e[1;35m{APP_NAME} {APP_VERSION}\\e[0m - {title.replace(chr(39), '')}'\necho \"Started: $(date)\"\ncd /tmp || exit 1"
+        tail = SCRIPT_FOOTER
+        if pause:
+            tail += "read -rp $'\\nPress Enter to close this window...' _\n"
+        else:
+            tail += "sleep 3\n"
+        tail += 'rm -f -- "$0"\n'
+        return f"{header}\n{SCRIPT_HELPERS}\n{banner}\n\n{body}\n{tail}"
+
+    def find_terminal(self):
+        candidates = [
+            ("x-terminal-emulator", ["-e"]), ("gnome-terminal", ["--"]), ("kgx", ["--"]), ("ptyxis", ["--"]),
+            ("konsole", ["-e"]), ("xfce4-terminal", ["-x"]), ("mate-terminal", ["-x"]), ("tilix", ["-e"]),
+            ("terminator", ["-x"]), ("qterminal", ["-e"]), ("lxterminal", ["-e"]), ("kitty", []),
+            ("alacritty", ["-e"]), ("foot", []), ("xterm", ["-e"]),
+        ]
+        for binary, args in candidates:
+            path = shutil.which(binary)
+            if path:
+                return [path] + args
+        return None
+
+    def run_root(self, title, cmds, pause=True, confirm=None):
+        """Write cmds to a script and run it with root rights in a terminal."""
+        if confirm and not messagebox.askyesno(APP_NAME, confirm):
+            return False
+        term = self.find_terminal()
+        if not term:
+            messagebox.showerror(APP_NAME, "No terminal emulator was found. Please install one, e.g.:\n\nsudo apt install xterm")
+            return False
+        script = self.build_script(title, cmds, pause)
+        fd, path = tempfile.mkstemp(prefix="debos-", suffix=".sh")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(script)
+        os.chmod(path, 0o700)
+        if os.geteuid() == 0:
+            launcher = ["bash", path]
+        elif shutil.which("sudo"):
+            launcher = ["sudo", "bash", path]
+        else:
+            launcher = ["su", "-c", f"bash {shlex.quote(path)}"]
+        try:
+            subprocess.Popen(term + launcher, start_new_session=True)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Could not start the terminal:\n{exc}")
+            return False
+        self.set_status(f"{self.t('terminal_opened')}: {title}")
+        return True
+
+    def run_user(self, title, cmds):
+        """Run non-privileged commands in a terminal (still logged by sudo-less shell)."""
+        term = self.find_terminal()
+        if not term:
+            messagebox.showerror(APP_NAME, "No terminal emulator was found.")
+            return
+        script = "#!/bin/bash\n" + "\n".join(cmds) + "\nread -rp $'\\nPress Enter to close this window...' _\nrm -f -- \"$0\"\n"
+        fd, path = tempfile.mkstemp(prefix="debos-", suffix=".sh")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(script)
+        os.chmod(path, 0o700)
+        subprocess.Popen(term + ["bash", path], start_new_session=True)
+        self.set_status(f"{self.t('terminal_opened')}: {title}")
+
+    def in_thread(self, work, done):
+        """Run work() in a thread and deliver its result to done() on the Tk thread.
+
+        Tk must only be touched from the main thread, so results travel through a
+        queue that poll_results() drains with after()."""
+        def runner():
+            try:
+                result = work()
+            except Exception as exc:  # keep the GUI alive whatever happens
+                result = exc
+            self.results.put((done, result))
+        threading.Thread(target=runner, daemon=True).start()
+
+    def poll_results(self):
+        try:
+            while True:
+                done, result = self.results.get_nowait()
+                try:
+                    done(result)
+                except tk.TclError:
+                    pass  # the widget was rebuilt (language/theme change) meanwhile
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll_results)
+
+    # =======================================================================
+    # Dashboard
+    # =======================================================================
+    def page_dashboard(self):
+        body, _actions = self.new_page("dashboard")
+        P = self.P
+        self.dash_stats = {}
+        grid = tk.Frame(body, bg=P["bg"])
+        grid.pack(fill="x")
+        tiles = [("os", "Operating System"), ("branch", "Debian Branch"), ("kernel", "Kernel"), ("desktop", "Desktop"),
+                 ("cpu", "Processor"), ("memory", "Memory"), ("disk", "Disk ( / )"), ("uptime", "Uptime"),
+                 ("packages", "Packages"), ("updates", "Updates Available"), ("health", "Package Health"), ("secure", "Secure Boot")]
+        for i, (key, title) in enumerate(tiles):
+            tile = tk.Frame(grid, bg=P["surface"], highlightbackground=P["border"], highlightthickness=1)
+            tile.grid(row=i // 4, column=i % 4, sticky="nsew", padx=(0, 10), pady=(0, 10))
+            tk.Label(tile, text=title.upper(), font=self.F["navsec"], fg=P["muted"], bg=P["surface"]).pack(anchor="w", padx=14, pady=(12, 0))
+            val = tk.Label(tile, text="…", font=self.F["h3"], fg=P["text"], bg=P["surface"], justify="left", wraplength=210, anchor="w")
+            val.pack(anchor="w", fill="x", padx=14, pady=(2, 12))
+            tile.bind("<Configure>", lambda e, lbl=val: lbl.config(wraplength=max(e.width - 32, 80)))
+            self.dash_stats[key] = val
+        for c in range(4):
+            grid.columnconfigure(c, weight=1, uniform="tiles")
+
+        c = self.card(body, "Quick Actions", "Common maintenance tasks. Each one opens a terminal so you can follow the progress.")
+        self.button_row(c, [
+            ("Update & Upgrade", self.quick_upgrade, "primary"),
+            ("Full Upgrade (dist-upgrade)", self.quick_full_upgrade),
+            ("Fix Broken Packages", self.quick_fix),
+            ("Clean System…", lambda: self.show_page("clean")),
+            ("Refresh", self.on_show_dashboard),
+        ])
+
+        self.dash_note = self.card(body, "Branch Notes")
+        self.label(self.dash_note, self.branch_advice(), "body", wraplength=850).pack(anchor="w")
+
+    def branch_advice(self):
+        b = self.sys["branch"]
+        if self.sys["is_lmde"]:
+            return ("You are running LMDE. Debian software and drivers work normally, but do not switch the Debian branch: "
+                    "LMDE manages its own repositories. Third-party repositories use the Debian codename "
+                    f"'{self.sys['repo_codename']}'.")
+        if b == "sid":
+            return ("Sid (unstable) receives packages first and can break. Recommended: install apt-listbugs and apt-listchanges "
+                    "(Updates & Release page), always read what a full-upgrade wants to REMOVE, and keep Timeshift snapshots. "
+                    f"Third-party repositories are configured for '{self.sys['repo_codename']}'.")
+        if b == "testing":
+            return ("Testing has no timely security support and may have broken dependencies during transitions. "
+                    "Upgrade regularly with full-upgrade and keep snapshots. "
+                    f"Third-party repositories are configured for '{self.sys['repo_codename']}'.")
+        if b == "stable":
+            return ("Debian Stable: the most reliable choice. Enable unattended security upgrades in Tweaks & Tools, "
+                    "and use the Backports kernel if you need newer hardware support.")
+        if b in ("oldstable", "oldoldstable"):
+            return (f"You are on Debian {BRANCH_LABEL[b]} ({self.sys['debian_codename']}). A newer stable release ({STABLE_CODENAME}) "
+                    "is available - see Updates & Release to upgrade safely.")
+        return "This system was not recognized as Debian. Some features may not work as expected."
+
+    def gather_dashboard(self):
+        d = {}
+        s = self.sys
+        d["os"] = s["pretty"]
+        d["branch"] = BRANCH_LABEL.get(s["branch"], "Unknown") + (f"  ({s['debian_codename']})" if s["debian_codename"] else "")
+        d["kernel"] = os.uname().release
+        d["desktop"] = (os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION") or "Unknown") + \
+            f"  ({os.environ.get('XDG_SESSION_TYPE', 'x11')})"
+        cpu = "Unknown"
+        for line in read_file("/proc/cpuinfo").splitlines():
+            if line.startswith("model name"):
+                cpu = re.sub(r"\s+", " ", line.split(":", 1)[1].strip())
+                break
+        cores = os.cpu_count() or 1
+        lvl = f", x86-64-v{self.cpu_level}" if self.cpu_level else ""
+        d["cpu"] = f"{cpu}  ({cores} threads{lvl})"
+        mem = {}
+        for line in read_file("/proc/meminfo").splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                mem[parts[0].rstrip(":")] = int(parts[1]) * 1024
+        if mem.get("MemTotal"):
+            used = mem["MemTotal"] - mem.get("MemAvailable", 0)
+            d["memory"] = f"{human_size(used)} / {human_size(mem['MemTotal'])}"
+        du = shutil.disk_usage("/")
+        d["disk"] = f"{human_size(du.used)} / {human_size(du.total)}  ({du.used * 100 // max(du.total, 1)}%)"
+        try:
+            secs = int(float(read_file("/proc/uptime", "0").split()[0]))
+            d["uptime"] = f"{secs // 86400}d {secs % 86400 // 3600}h {secs % 3600 // 60}m"
+        except Exception:
+            d["uptime"] = "?"
+        debs = len(installed_packages())
+        fps = len(installed_flatpaks())
+        d["packages"] = f"{debs} deb" + (f"  ·  {fps} flatpak" if fps else "")
+        sim = run_cmd(["apt-get", "-s", "-o", "Debug::NoLocking=1", "dist-upgrade"], timeout=60)
+        n = sum(1 for line in sim.splitlines() if line.startswith("Inst "))
+        d["updates"] = f"{n} package(s)" if sim else "Unknown (run apt update)"
+        d["health"] = "Problems found - run Repair" if run_cmd(["dpkg", "--audit"], timeout=30) else "OK"
+        d["secure"] = "Enabled" if self.secure_boot else ("Disabled" if os.path.isdir("/sys/firmware/efi") else "Legacy BIOS")
+        return d
+
+    def on_show_dashboard(self):
+        for lbl in self.dash_stats.values():
+            lbl.config(text=self.t("loading"))
+        self.in_thread(self.gather_dashboard, self.fill_dashboard)
+
+    def fill_dashboard(self, data):
+        if isinstance(data, Exception) or "dashboard" not in self.pages:
+            return
+        for key, val in data.items():
+            lbl = self.dash_stats.get(key)
+            if lbl and lbl.winfo_exists():
+                color = self.P["text"]
+                if key == "health":
+                    color = self.P["success"] if val == "OK" else self.P["danger"]
+                elif key == "updates" and val.startswith("0 "):
+                    color = self.P["success"]
+                lbl.config(text=val, fg=color)
+
+    def quick_upgrade(self):
+        self.run_root("Update & Upgrade", [
+            "step 'Refreshing package lists'", "apt_update",
+            "step 'Upgrading packages'", "apt-get upgrade -y",
+            "if command -v flatpak >/dev/null; then step 'Updating Flatpaks'; flatpak update -y --noninteractive; fi",
+        ])
+
+    def quick_full_upgrade(self):
+        self.run_root("Full Upgrade", [
+            "step 'Refreshing package lists'", "apt_update",
+            "step 'Full upgrade - read the list of packages to be REMOVED before confirming'",
+            "apt-get full-upgrade",
+            "step 'Removing packages that are no longer needed'", "apt-get autoremove --purge -y",
+            "if command -v flatpak >/dev/null; then step 'Updating Flatpaks'; flatpak update -y --noninteractive; fi",
+        ])
+
+    def quick_fix(self):
+        self.run_root("Fix Broken Packages", [
+            "step 'Configuring interrupted packages'", "dpkg --configure -a",
+            "step 'Fixing broken dependencies'", "apt-get --fix-broken install -y",
+            "apt_update", "apt-get check && ok 'Package database is consistent.'",
+        ])
+
+    # =======================================================================
+    # Clean system
+    # =======================================================================
+    CLEAN_OPTIONS = [
+        ("autoremove", True, "Remove unused packages and old kernels", "apt-get autoremove --purge (keeps the running and newest kernel)."),
+        ("apt_cache", True, "Clear APT package cache", "Downloaded .deb files in /var/cache/apt/archives."),
+        ("rc_configs", True, "Purge residual configuration files", "Leftover configs from packages that were removed (dpkg state 'rc')."),
+        ("journal", True, "Shrink system journal", "Keep only the last 7 days / 200 MB of systemd logs."),
+        ("flatpak", True, "Remove unused Flatpak runtimes", "flatpak uninstall --unused."),
+        ("thumbs", True, "Clear thumbnail cache", "~/.cache/thumbnails of your user (regenerated automatically)."),
+        ("old_logs", False, "Delete rotated logs", "Compressed and rotated files in /var/log (*.gz, *.1, *.old)."),
+        ("trash", False, "Empty your Trash", "~/.local/share/Trash - this cannot be undone."),
+        ("tmp", False, "Clean old temporary files", "Files and empty folders in /tmp untouched for more than 7 days."),
+        ("duplicates", False, "Find duplicate files in ~/Downloads", "Interactive fdupes session: you choose what to keep."),
+        ("update_grub", False, "Update GRUB menu afterwards", "Regenerates the boot menu after kernels were removed."),
+    ]
+
+    def page_clean(self):
+        body, actions = self.new_page("clean")
+        self.cl_vars = {}
+        c = self.card(body, "Cleaning Options", "Sizes are estimates calculated when the page opens.")
+        self.clean_size_labels = {}
+        for key, default, title, desc in self.CLEAN_OPTIONS:
+            v = tk.BooleanVar(value=default)
+            self.cl_vars[key] = v
+            row = self.check(c, v, title, desc, style="Item.TCheckbutton")
+            lbl = tk.Label(row.winfo_children()[0], text="", font=self.F["small"], fg=self.P["accent"], bg=self.P["surface"])
+            lbl.pack(side="left", padx=10)
+            self.clean_size_labels[key] = lbl
+        self.button(actions, "Execute Cleaning", self.run_cleaning, "primary").pack(side="left")
+        self.button(actions, self.t("select_all"), lambda: [v.set(True) for v in self.cl_vars.values()], "secondary").pack(side="left", padx=8)
+        self.button(actions, self.t("clear"), lambda: [v.set(False) for v in self.cl_vars.values()], "secondary").pack(side="left")
+
+    def on_show_clean(self):
+        def work():
+            sizes = {}
+            sizes["apt_cache"] = dir_size("/var/cache/apt/archives")
+            sizes["thumbs"] = dir_size(os.path.join(self.home, ".cache/thumbnails"))
+            sizes["trash"] = dir_size(os.path.join(self.home, ".local/share/Trash"))
+            out = run_cmd(["journalctl", "--disk-usage"], timeout=10)
+            m = re.search(r"take up ([\d.]+)([KMGT]?)", out)
+            if m:
+                mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}[m.group(2)]
+                sizes["journal"] = float(m.group(1)) * mult
+            old = 0
+            for pattern in ("/var/log/*.gz", "/var/log/*.[0-9]", "/var/log/*.old", "/var/log/*/*.gz", "/var/log/*/*.[0-9]"):
+                for f in glob.glob(pattern):
+                    try:
+                        old += os.path.getsize(f)
+                    except OSError:
+                        pass
+            sizes["old_logs"] = old
+            rc = run_cmd("dpkg -l | grep -c '^rc'", shell=True)
+            sizes["rc_configs"] = f"{rc} package(s)" if rc else None
+            return sizes
+
+        def done(sizes):
+            if isinstance(sizes, Exception):
+                return
+            for key, val in sizes.items():
+                lbl = self.clean_size_labels.get(key)
+                if lbl and lbl.winfo_exists() and val:
+                    lbl.config(text=val if isinstance(val, str) else f"≈ {human_size(val)}")
+        self.in_thread(work, done)
+
+    def run_cleaning(self):
+        v = {k: var.get() for k, var in self.cl_vars.items()}
+        if not any(v.values()):
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        cmds = ["BEFORE=$(df --output=avail -B1 / | tail -n1)"]
+        if v["autoremove"]:
+            cmds += ["step 'Removing unused packages and old kernels'", "apt-get autoremove --purge -y"]
+        if v["apt_cache"]:
+            cmds += ["step 'Clearing APT cache'", "apt-get clean"]
+        if v["rc_configs"]:
+            cmds += ["step 'Purging residual configuration files'",
+                     "RC=$(dpkg -l | awk '/^rc/ {print $2}')",
+                     "if [ -n \"$RC\" ]; then echo \"$RC\" | xargs dpkg --purge; else ok 'Nothing to purge.'; fi"]
+        if v["journal"]:
+            cmds += ["step 'Shrinking the systemd journal'", "journalctl --vacuum-time=7d --vacuum-size=200M"]
+        if v["flatpak"]:
+            cmds += ["if command -v flatpak >/dev/null; then step 'Removing unused Flatpak runtimes'; flatpak uninstall --unused -y --noninteractive; fi"]
+        if v["thumbs"]:
+            cmds += ["step 'Clearing thumbnail cache'", "rm -rf -- \"$TARGET_HOME/.cache/thumbnails/\"*"]
+        if v["old_logs"]:
+            cmds += ["step 'Deleting rotated logs'",
+                     "find /var/log -type f \\( -name '*.gz' -o -regex '.*\\.[0-9]+' -o -name '*.old' \\) -delete"]
+        if v["trash"]:
+            cmds += ["step 'Emptying Trash'", "rm -rf -- \"$TARGET_HOME/.local/share/Trash/files/\"* \"$TARGET_HOME/.local/share/Trash/info/\"*"]
+        if v["tmp"]:
+            cmds += ["step 'Cleaning old files in /tmp'",
+                     "find /tmp -mindepth 1 -xdev -type f -atime +7 ! -path '/tmp/.X11-unix/*' ! -path '/tmp/.ICE-unix/*' ! -path '/tmp/systemd-private-*' -delete 2>/dev/null || true",
+                     "find /tmp -mindepth 1 -xdev -type d -empty -mtime +7 ! -name '.*-unix' ! -name 'systemd-private-*' -delete 2>/dev/null || true"]
+        if v["duplicates"]:
+            cmds += ["step 'Searching duplicates in ~/Downloads (you will be asked which files to keep)'",
+                     "ensure_pkg fdupes",
+                     "sudo -u \"$TARGET_USER\" fdupes -r -d \"$TARGET_HOME/Downloads\" || true"]
+        if v["update_grub"]:
+            cmds += ["if command -v update-grub >/dev/null; then step 'Updating GRUB'; update-grub; fi"]
+        cmds += ["AFTER=$(df --output=avail -B1 / | tail -n1)",
+                 "FREED=$(( (AFTER - BEFORE) / 1024 / 1024 ))",
+                 "ok \"Free space change on /: ${FREED} MB\""]
+        self.run_root("Clean System", cmds)
+
+    # =======================================================================
+    # Repair APT
+    # =======================================================================
+    REPAIR_OPTIONS = [
+        ("dpkg", True, "Finish interrupted installations", "dpkg --configure -a"),
+        ("broken", True, "Fix broken dependencies", "apt-get --fix-broken install"),
+        ("locks", False, "Remove stale APT/dpkg locks", "Only removed when no apt/dpkg process is running."),
+        ("dedupe", True, "Remove duplicate repository lines", "Removes exact duplicate 'deb' lines in .list files (deb822 .sources files are left untouched)."),
+        ("keys", True, "Import missing repository keys (NO_PUBKEY)", "Fetches missing keys from keyserver.ubuntu.com and stores them in /etc/apt/trusted.gpg.d."),
+        ("lists", False, "Rebuild package lists", "Deletes /var/lib/apt/lists and downloads them again (fixes 'Hash Sum mismatch')."),
+        ("modernize", False, "Convert sources to the deb822 format", "Runs 'apt modernize-sources' (APT 3.0+, Debian 13 and newer). Backups are kept."),
+        ("keyring", False, "Reinstall Debian archive keyring", "Fixes expired or missing official Debian signing keys."),
+    ]
+
+    def page_repair(self):
+        body, actions = self.new_page("repair")
+        c = self.card(body, "Repair Tasks", "Run the tasks you need. Backups of all APT source files are made first.")
+        self.rp_vars = {}
+        for key, default, title, desc in self.REPAIR_OPTIONS:
+            v = tk.BooleanVar(value=default)
+            self.rp_vars[key] = v
+            self.check(c, v, title, desc, style="Item.TCheckbutton")
+        self.button(actions, "Run Repair", self.run_repair, "primary").pack(side="left")
+
+    def run_repair(self):
+        v = {k: var.get() for k, var in self.rp_vars.items()}
+        if not any(v.values()):
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        cmds = ["backup_apt_sources"]
+        if v["locks"]:
+            cmds += ["step 'Checking for stale locks'",
+                     "if pgrep -x 'apt|apt-get|dpkg|aptitude|unattended-upgr' >/dev/null; then warn 'A package manager is running - locks were NOT removed.'; else "
+                     "rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock; ok 'Locks removed.'; fi"]
+        if v["dpkg"]:
+            cmds += ["step 'Finishing interrupted installations'", "dpkg --configure -a"]
+        if v["dedupe"]:
+            cmds += ["step 'Removing duplicate repository lines'",
+                     "for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do [ -f \"$f\" ] || continue; "
+                     "awk '/^[[:space:]]*deb/ { key=$0; gsub(/[[:space:]]+/, \" \", key); if (seen[key]++) next } { print }' \"$f\" > \"$f.debos-tmp\" && "
+                     "if ! cmp -s \"$f\" \"$f.debos-tmp\"; then cat \"$f.debos-tmp\" > \"$f\"; ok \"Cleaned $f\"; fi; rm -f \"$f.debos-tmp\"; done"]
+        if v["keyring"]:
+            cmds += ["step 'Reinstalling the Debian archive keyring'", "apt-get install --reinstall -y debian-archive-keyring"]
+        if v["lists"]:
+            cmds += ["step 'Rebuilding package lists'", "rm -rf /var/lib/apt/lists/*", "mkdir -p /var/lib/apt/lists/partial"]
+        if v["modernize"]:
+            cmds += ["step 'Converting sources to deb822'",
+                     "if apt --help 2>/dev/null | grep -q modernize-sources || apt modernize-sources --help >/dev/null 2>&1; then apt modernize-sources -y || apt modernize-sources; else warn 'Your APT version has no modernize-sources (needs APT 3.0 / Debian 13+).'; fi"]
+        if v["keys"]:
+            cmds += ["step 'Looking for missing repository keys'",
+                     "ensure_pkg gnupg dirmngr",
+                     "export GNUPGHOME=$(mktemp -d)",
+                     "apt-get update 2>&1 | tee /tmp/debos-apt-update.log >/dev/null || true",
+                     "MISSING=$(grep -oE 'NO_PUBKEY [0-9A-F]+' /tmp/debos-apt-update.log | awk '{print $2}' | sort -u)",
+                     "if [ -z \"$MISSING\" ]; then ok 'No missing keys.'; fi",
+                     "for key in $MISSING; do echo \"Fetching $key\"; "
+                     "if gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys \"$key\"; then gpg --batch --export \"$key\" > \"/etc/apt/trusted.gpg.d/debos-$key.gpg\" && ok \"Imported $key\"; else fail \"Could not fetch key $key\"; fi; done",
+                     "rm -rf \"$GNUPGHOME\" /tmp/debos-apt-update.log"]
+        cmds += ["step 'Refreshing package lists'", "apt_update"]
+        if v["broken"]:
+            cmds += ["step 'Fixing broken dependencies'", "apt-get --fix-broken install -y"]
+        cmds += ["apt-get check && ok 'Package database is consistent.'"]
+        self.run_root("Repair APT & Keys", cmds)
+
+    # =======================================================================
+    # Updates & Release (Stable / Testing / Sid)
+    # =======================================================================
+    def page_release(self):
+        body, _actions = self.new_page("release")
+        P = self.P
+        s = self.sys
+        c = self.card(body, "System Updates")
+        self.label(c, f"Current system: {branch_badge(s)}", "bold").pack(anchor="w", pady=(0, 6))
+        self.button_row(c, [
+            ("Check for Updates", self.check_updates, "primary"),
+            ("Update & Upgrade", self.quick_upgrade),
+            ("Full Upgrade", self.quick_full_upgrade),
+            ("Update Flatpaks", lambda: self.run_root("Update Flatpaks", ["ensure_pkg flatpak", "flatpak update -y --noninteractive"])),
+        ])
+        if s["branch"] in ("testing", "sid"):
+            self.button_row(c, [("Install apt-listbugs & apt-listchanges", lambda: self.run_root(
+                "apt-listbugs", ["apt_update", "apt_install apt-listbugs apt-listchanges", "ok 'apt-listbugs will now warn you about critical bugs before upgrades.'"]))])
+
+        c = self.card(body, "Switch Debian Branch",
+                      "Generate a clean deb822 'debian.sources' for Debian Stable, Testing or Sid. Upgrading (Stable → Testing → Sid) "
+                      "is supported by Debian; downgrading is NOT. Third-party repositories are left untouched.")
+        self.rel_branch = tk.StringVar(value=s["branch"] if s["branch"] in ("stable", "testing", "sid") else "stable")
+        opts = tk.Frame(c, bg=P["surface"])
+        opts.pack(anchor="w", pady=4)
+        for val, text in (("stable", f"Stable  ({STABLE_CODENAME}, Debian {DEBIAN_RELEASES[STABLE_CODENAME]})"),
+                          ("testing", f"Testing  ({TESTING_CODENAME})"),
+                          ("sid", "Unstable  (sid)")):
+            ttk.Radiobutton(opts, text=text, value=val, variable=self.rel_branch, command=self.update_release_preview).pack(side="left", padx=(0, 18))
+        self.rel_alias = tk.BooleanVar(value=False)
+        self.rel_nonfree = tk.BooleanVar(value=True)
+        self.rel_src = tk.BooleanVar(value=False)
+        self.rel_bpo = tk.BooleanVar(value=False)
+        self.rel_listbugs = tk.BooleanVar(value=True)
+        self.rel_mirror = tk.StringVar(value=DEBIAN_MIRROR)
+        for var, text, desc in (
+            (self.rel_alias, "Follow the rolling alias ('stable' / 'testing') instead of the codename",
+             "With the alias your system automatically moves to the next release. With the codename it stays until you change it."),
+            (self.rel_nonfree, "Include contrib, non-free and non-free-firmware", "Needed for most Wi-Fi firmware, NVIDIA drivers, Steam, codecs."),
+            (self.rel_src, "Include source packages (deb-src)", None),
+            (self.rel_bpo, "Enable backports (Stable only)", "Newer kernels and software, rebuilt for Stable."),
+            (self.rel_listbugs, "Install apt-listbugs & apt-listchanges (Testing/Sid)", "Warns about critical bugs before they reach your system."),
+        ):
+            self.check(c, var, text, desc)
+            var.trace_add("write", lambda *_: self.update_release_preview())
+        mrow = tk.Frame(c, bg=P["surface"])
+        mrow.pack(anchor="w", pady=6)
+        self.label(mrow, "Mirror:").pack(side="left")
+        cb = ttk.Combobox(mrow, textvariable=self.rel_mirror, width=45, values=[
+            DEBIAN_MIRROR, "http://deb.debian.org/debian", "https://mirrors.kernel.org/debian", "https://ftp.debian.org/debian"])
+        cb.pack(side="left", padx=8)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.update_release_preview())
+        cb.bind("<KeyRelease>", lambda e: self.update_release_preview())
+        self.rel_preview = self.text_box(c, height=14)
+        self.rel_preview.pack(fill="x", pady=8)
+        self.update_release_preview()
+        self.button_row(c, [
+            ("Apply & Upgrade", self.apply_release, "danger"),
+            ("Open in APT Sources Editor", self.release_to_editor),
+        ])
+
+    def generate_debian_sources(self):
+        branch = self.rel_branch.get()
+        alias = self.rel_alias.get()
+        comps = "main contrib non-free non-free-firmware" if self.rel_nonfree.get() else "main non-free-firmware"
+        types = "deb deb-src" if self.rel_src.get() else "deb"
+        mirror = self.rel_mirror.get().strip() or DEBIAN_MIRROR
+        if branch == "sid":
+            suites, security = ["sid"], None
+        else:
+            name = branch if alias else (STABLE_CODENAME if branch == "stable" else TESTING_CODENAME)
+            suites = [name, f"{name}-updates"]
+            if branch == "stable" and self.rel_bpo.get():
+                suites.append(f"{name}-backports")
+            security = f"{name}-security"
+        lines = [f"# Debian {BRANCH_LABEL[branch]} - generated by {APP_NAME} {APP_VERSION}",
+                 f"Types: {types}", f"URIs: {mirror}", f"Suites: {' '.join(suites)}", f"Components: {comps}",
+                 f"Signed-By: {DEBIAN_KEYRING}"]
+        if security:
+            lines += ["", f"Types: {types}", f"URIs: {DEBIAN_SECURITY}", f"Suites: {security}", f"Components: {comps}",
+                      f"Signed-By: {DEBIAN_KEYRING}"]
+        return "\n".join(lines) + "\n"
+
+    def update_release_preview(self):
+        if not hasattr(self, "rel_preview") or not self.rel_preview.winfo_exists():
+            return
+        self.rel_preview.config(state="normal")
+        self.rel_preview.delete("1.0", "end")
+        self.rel_preview.insert("1.0", self.generate_debian_sources())
+
+    def release_to_editor(self):
+        content = self.rel_preview.get("1.0", "end-1c")
+        self.show_page("sources")
+        self.src_var.set("/etc/apt/sources.list.d/debian.sources")
+        self.src_txt.delete("1.0", "end")
+        self.src_txt.insert("1.0", content)
+        self.set_status("Generated sources loaded into the editor - review, then Save.")
+
+    def apply_release(self):
+        s = self.sys
+        target = self.rel_branch.get()
+        if s["is_lmde"]:
+            return messagebox.showerror(APP_NAME, "Switching the Debian branch is not supported on LMDE. LMDE manages its own repositories.")
+        if s["id"] != "debian":
+            if not messagebox.askyesno(APP_NAME, "This system does not identify itself as Debian. Continue anyway?"):
+                return
+        cur_rank = BRANCH_RANK.get(s["branch"], 2)
+        if BRANCH_RANK[target] < cur_rank:
+            if not messagebox.askyesno(APP_NAME, f"WARNING: moving from {BRANCH_LABEL.get(s['branch'])} to {BRANCH_LABEL[target]} is a DOWNGRADE.\n\n"
+                                       "Debian does not support downgrades. Packages will stay at their newer versions until the target branch catches up, "
+                                       "and mixing can break your system.\n\nDo you really want to continue?", icon="warning"):
+                return
+        content = self.rel_preview.get("1.0", "end-1c").strip() + "\n"
+        fd, tmp = tempfile.mkstemp(prefix="debos-sources-")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(tmp, 0o644)
+        disable_re = r"(debian\.org|\/debian(-security)?\/?)[[:space:]].*[[:space:]]main([[:space:]]|$)"
+        cmds = [
+            "backup_apt_sources",
+            "step 'Writing /etc/apt/sources.list.d/debian.sources'",
+            f"install -m 0644 {shlex.quote(tmp)} /etc/apt/sources.list.d/debian.sources && rm -f {shlex.quote(tmp)}",
+            "step 'Disabling old Debian entries in .list files (third-party repositories are kept)'",
+            "for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do [ -f \"$f\" ] || continue; "
+            f"sed -i -E '/^[[:space:]]*deb(-src)?[[:space:]].*{disable_re}/ s/^/# disabled by Debos: /' \"$f\"; done",
+            "for f in /etc/apt/sources.list.d/*.sources; do [ -f \"$f\" ] || continue; [ \"$f\" = /etc/apt/sources.list.d/debian.sources ] && continue; "
+            "if grep -qE '^URIs:.*debian\\.org' \"$f\"; then mv \"$f\" \"$f.disabled\"; warn \"Disabled $f\"; fi; done",
+        ]
+        if target in ("testing", "sid") and self.rel_listbugs.get():
+            cmds += ["apt_update", "step 'Installing apt-listbugs and apt-listchanges'", "apt_install apt-listbugs apt-listchanges"]
+        cmds += [
+            "step 'Refreshing package lists'", "apt_update",
+            "step 'Upgrading to the selected branch - review the summary carefully before answering Y'",
+            "apt-get upgrade --without-new-pkgs",
+            "apt-get full-upgrade",
+            "apt-get autoremove --purge",
+            "ok 'Done. Please reboot to start the new kernel and libraries.'",
+        ]
+        msg = (f"Switch to Debian {BRANCH_LABEL[target]} and run a full upgrade?\n\n"
+               "• Make a backup or Timeshift snapshot first.\n• Your current sources are backed up to /var/backups/debos-toolbox.\n"
+               "• The upgrade can take a long time and asks for confirmation in the terminal.")
+        self.run_root(f"Switch to Debian {BRANCH_LABEL[target]}", cmds, confirm=msg)
+
+    def check_updates(self):
+        self.run_root("Check for Updates", [
+            "apt_update", "step 'Upgradable packages'", "apt list --upgradable 2>/dev/null | tail -n +2",
+            "if command -v flatpak >/dev/null; then step 'Flatpak updates'; flatpak remote-ls --updates 2>/dev/null || true; fi"])
+
+    # =======================================================================
+    # APT sources editor
+    # =======================================================================
+    def page_sources(self):
+        body, actions = self.new_page("sources", scroll=False)
+        P = self.P
+        c = self.card(body)
+        row = tk.Frame(c, bg=P["surface"])
+        row.pack(fill="x")
+        self.label(row, "File:", "bold").pack(side="left")
+        self.src_var = tk.StringVar(value="/etc/apt/sources.list.d/debian.sources" if os.path.exists("/etc/apt/sources.list.d/debian.sources") else "/etc/apt/sources.list")
+        self.src_cb = ttk.Combobox(row, textvariable=self.src_var, width=60)
+        self.src_cb.pack(side="left", padx=8)
+        self.src_cb.bind("<<ComboboxSelected>>", lambda e: self.load_sources())
+        self.button(row, "Load", self.load_sources, "secondary").pack(side="left")
+        self.src_txt = self.text_box(body, height=20)
+        self.src_txt.pack(fill="both", expand=True, pady=(0, 6))
+        self.button(actions, "Save File", self.save_sources, "primary").pack(side="left")
+        self.button(actions, "apt update", lambda: self.run_root("apt update", ["apt_update"]), "secondary").pack(side="left", padx=8)
+        self.button(actions, "Enable contrib / non-free", lambda: self.run_root("Enable components", ["backup_apt_sources", "enable_components", "apt_update"]), "secondary").pack(side="left")
+        self.button(actions, "Full Upgrade", self.quick_full_upgrade, "danger").pack(side="left", padx=8)
+        self.load_sources()
+
+    def on_show_sources(self):
+        self.src_cb["values"] = apt_source_files() + ["/etc/apt/sources.list.d/debian.sources"]
+
+    def load_sources(self):
+        path = self.src_var.get()
+        self.src_txt.delete("1.0", "end")
+        if os.path.exists(path):
+            self.src_txt.insert("1.0", read_file(path, f"# Could not read {path}\n"))
+        else:
+            self.src_txt.insert("1.0", f"# {path} does not exist yet.\n# Add repository entries here and click 'Save File' to create it.\n")
+
+    def save_sources(self):
+        path = self.src_var.get().strip()
+        if not re.match(r"^/etc/apt/(sources\.list|sources\.list\.d/[A-Za-z0-9._-]+\.(list|sources))$", path):
+            return messagebox.showerror(APP_NAME, "Only /etc/apt/sources.list or files ending in .list / .sources inside /etc/apt/sources.list.d can be saved.")
+        fd, tmp = tempfile.mkstemp(prefix="debos-sources-")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            content = self.src_txt.get("1.0", "end-1c")
+            fh.write(content if content.endswith("\n") else content + "\n")
+        os.chmod(tmp, 0o644)
+        q = shlex.quote(path)
+        self.run_root(f"Save {path}", [
+            "backup_apt_sources",
+            f"install -D -m 0644 {shlex.quote(tmp)} {q} && rm -f {shlex.quote(tmp)} && ok 'Saved {path}'",
+            "step 'Checking the new configuration'", "apt_update",
+        ])
+
+    # =======================================================================
+    # Install software
+    # =======================================================================
+    def page_install(self):
+        body, actions = self.new_page("install", scroll=False)
+        P = self.P
+        top = tk.Frame(body, bg=P["bg"])
+        top.pack(fill="x", pady=(0, 6))
+        tk.Label(top, text=self.t("search") + ":", bg=P["bg"], fg=P["text"], font=self.F["bold"]).pack(side="left")
+        self.sw_filter = tk.StringVar()
+        ent = ttk.Entry(top, textvariable=self.sw_filter, width=36)
+        ent.pack(side="left", padx=8)
+        self.sw_filter.trace_add("write", lambda *_: self.filter_software())
+        self.sw_info = tk.Label(top, text="", bg=P["bg"], fg=P["muted"], font=self.F["small"])
+        self.sw_info.pack(side="left", padx=10)
+
+        nb = ttk.Notebook(body)
+        nb.pack(fill="both", expand=True)
+        t1 = tk.Frame(nb, bg=P["bg"])
+        t2 = tk.Frame(nb, bg=P["bg"])
+        nb.add(t1, text="  APT / Vendor Packages  ")
+        nb.add(t2, text="  Flatpak (Flathub)  ")
+        self.deb_vars, self.fp_vars, self.sw_rows = {}, {}, []
+        self.sw_badges = {}
+
+        sa = self.scroll_area(t1)
+        for cat in CATS:
+            items = [(k, v) for k, v in SOFTWARE.items() if v[3] == cat]
+            if not items:
+                continue
+            c = self.card(sa, cat)
+            for key, (icon, name, desc, _cat, pkg, _recipe) in sorted(items, key=lambda kv: kv[1][1].lower()):
+                var = tk.BooleanVar()
+                self.deb_vars[key] = var
+                row = self.check(c, var, f"{icon}  {name}", desc, style="Item.TCheckbutton")
+                self.sw_rows.append((row, c, f"{name} {desc} {cat}".lower()))
+                self.sw_badges[("deb", pkg)] = row.winfo_children()[0]
+
+        sf = self.scroll_area(t2)
+        c0 = self.card(sf, "Flatpak Setup", "Flatpak and the Flathub repository are configured automatically when you install a Flatpak.")
+        self.button_row(c0, [
+            ("Set up Flatpak + Flathub", lambda: self.run_root("Flatpak setup", self.flatpak_setup_cmds(store_plugin=True))),
+            ("Update all Flatpaks", lambda: self.run_root("Update Flatpaks", ["ensure_pkg flatpak", "flatpak update -y --noninteractive"])),
+        ])
+        for cat in CATS:
+            items = [f for f in FLATPAKS if f[4] == cat]
+            if not items:
+                continue
+            c = self.card(sf, cat)
+            for app_id, icon, name, desc, _cat in sorted(items, key=lambda x: x[2].lower()):
+                var = tk.BooleanVar()
+                self.fp_vars[app_id] = var
+                row = self.check(c, var, f"{icon}  {name}", f"{desc}  ({app_id})", style="Item.TCheckbutton")
+                self.sw_rows.append((row, c, f"{name} {desc} {app_id} {cat}".lower()))
+                self.sw_badges[("fp", app_id)] = row.winfo_children()[0]
+
+        self.button(actions, "Install Selected", self.install_software, "primary").pack(side="left")
+        self.button(actions, self.t("clear"), lambda: [v.set(False) for v in list(self.deb_vars.values()) + list(self.fp_vars.values())], "secondary").pack(side="left", padx=8)
+
+    def on_show_install(self):
+        if getattr(self, "_install_scanned", False):
+            return
+        self._install_scanned = True
+        self.sw_info.config(text="Checking installed applications…")
+
+        def done(result):
+            if isinstance(result, Exception):
+                return
+            debs, fps = result
+            count = 0
+            for (kind, name), line in self.sw_badges.items():
+                if not line.winfo_exists():
+                    continue
+                if (kind == "deb" and name in debs) or (kind == "fp" and name in fps):
+                    tk.Label(line, text=f" ✓ {self.t('installed')} ", font=self.F["small"], fg="#FFFFFF", bg=self.P["success"]).pack(side="left", padx=8)
+                    count += 1
+            self.sw_info.config(text=f"{count} of the listed applications are already installed.")
+        self.in_thread(lambda: (installed_packages(), installed_flatpaks()), done)
+
+    def filter_software(self):
+        q = self.sw_filter.get().strip().lower()
+        visible_cards = set()
+        for row, card, text in self.sw_rows:
+            row.pack_forget()
+        for row, card, text in self.sw_rows:
+            if not q or q in text:
+                row.pack(fill="x", pady=3)
+                visible_cards.add(card)
+        for row, card, text in self.sw_rows:
+            outer = card.master
+            if card in visible_cards:
+                if not outer.winfo_ismapped():
+                    outer.pack(fill="x", pady=(0, 12), padx=(0, 6))
+            else:
+                outer.pack_forget()
+
+    def flatpak_setup_cmds(self, store_plugin=False):
+        cmds = ["step 'Setting up Flatpak and Flathub'", "ensure_pkg flatpak",
+                "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo"]
+        if store_plugin:
+            cmds += ["is_installed gnome-software && apt_install gnome-software-plugin-flatpak || true",
+                     "is_installed plasma-discover && apt_install plasma-discover-backend-flatpak || true",
+                     "ok 'Flathub is ready. Log out and back in to see Flatpak apps in your menu.'"]
+        return cmds
+
+    def install_software(self):
+        debs = [k for k, v in self.deb_vars.items() if v.get()]
+        fps = [k for k, v in self.fp_vars.items() if v.get()]
+        if not debs and not fps:
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        cmds = ["step 'Refreshing package lists'", "apt_update", "ensure_pkg curl wget gpg ca-certificates"]
+        for key in debs:
+            icon, name, _d, _c, _p, recipe = SOFTWARE[key]
+            cmds.append(f"step {shlex.quote('Installing ' + name)}")
+            cmds += recipe
+        if fps:
+            cmds += self.flatpak_setup_cmds()
+            cmds += ["step 'Installing Flatpak applications'",
+                     f"flatpak install -y --noninteractive flathub {' '.join(shlex.quote(f) for f in fps)}"]
+        self._install_scanned = False
+        names = [SOFTWARE[k][1] for k in debs] + fps
+        self.run_root("Install Software", cmds, confirm=f"Install {len(names)} item(s)?\n\n• " + "\n• ".join(names[:25]) + ("\n…" if len(names) > 25 else ""))
+
+    # =======================================================================
+    # Uninstall software
+    # =======================================================================
+    PROTECTED = {"apt", "dpkg", "bash", "coreutils", "systemd", "dbus", "sudo", "network-manager", "policykit-1", "polkitd",
+                 "gnome-shell", "gnome-session", "gnome-control-center", "plasma-desktop", "plasma-workspace", "systemsettings",
+                 "xfce4-session", "xfce4-panel", "xfce4-settings", "cinnamon", "mate-panel", "lxqt-session", "nautilus",
+                 "dolphin", "thunar", "nemo", "caja", "pcmanfm", "debos-toolbox", "xdg-utils", "desktop-file-utils"}
+
+    def page_uninstall(self):
+        body, actions = self.new_page("uninstall", scroll=False)
+        P = self.P
+        top = tk.Frame(body, bg=P["bg"])
+        top.pack(fill="x", pady=(0, 8))
+        tk.Label(top, text=self.t("search") + ":", bg=P["bg"], fg=P["text"], font=self.F["bold"]).pack(side="left")
+        self.un_filter = tk.StringVar()
+        ttk.Entry(top, textvariable=self.un_filter, width=36).pack(side="left", padx=8)
+        self.un_filter.trace_add("write", lambda *_: self.render_uninstall())
+        self.un_info = tk.Label(top, text="", bg=P["bg"], fg=P["muted"], font=self.F["small"])
+        self.un_info.pack(side="left", padx=10)
+        outer = tk.Frame(body, bg=P["surface"], highlightbackground=P["border"], highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        self.un_list = self.scroll_area(outer, bg=P["surface"])
+        self.un_items, self.u_vars = [], {}
+        self.button(actions, "Uninstall Selected", self.uninstall_software, "danger").pack(side="left")
+        self.button(actions, self.t("refresh"), self.refresh_uninstall, "secondary").pack(side="left", padx=8)
+
+    def on_show_uninstall(self):
+        if getattr(self, "un_cache", None):
+            self.un_items = self.un_cache
+            self.render_uninstall()
+        elif not self.un_items:
+            self.refresh_uninstall()
+
+    def refresh_uninstall(self):
+        for w in self.un_list.winfo_children():
+            w.destroy()
+        self.label(self.un_list, "Scanning installed applications…", fg=self.P["muted"]).pack(anchor="w", padx=14, pady=12)
+        self.in_thread(self.scan_applications, self.uninstall_loaded)
+
+    def scan_applications(self):
+        apps = {}
+        desktop_files = glob.glob("/usr/share/applications/*.desktop")
+        names = {}
+        for path in desktop_files:
+            text = read_file(path)
+            if re.search(r"^NoDisplay\s*=\s*true", text, re.M) or "[Desktop Entry]" not in text:
+                continue
+            m = re.search(r"^Name\s*=\s*(.+)$", text, re.M)
+            names[path] = m.group(1).strip() if m else os.path.basename(path)
+        paths = list(names)
+        for i in range(0, len(paths), 150):
+            out = run_cmd(["dpkg", "-S"] + paths[i:i + 150], timeout=60)
+            for line in out.splitlines():
+                if ": " not in line:
+                    continue
+                pkgs, path = line.split(": ", 1)
+                for pkg in pkgs.split(","):
+                    pkg = pkg.strip().split(":")[0]
+                    if pkg and pkg not in self.PROTECTED:
+                        apps.setdefault(("deb", pkg), set()).add(names.get(path.strip(), pkg))
+        essential = run_cmd(["dpkg-query", "-W", "-f=${Package} ${Essential} ${Priority}\n"], timeout=20)
+        for line in essential.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and (parts[1] == "yes" or parts[2] in ("required", "important")):
+                apps.pop(("deb", parts[0]), None)
+        if shutil.which("flatpak"):
+            out = run_cmd(["flatpak", "list", "--app", "--columns=application,name"], timeout=20)
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if parts and parts[0]:
+                    apps[("flatpak", parts[0])] = {parts[1] if len(parts) > 1 else parts[0]}
+        return sorted(((kind, pkg, ", ".join(sorted(n))) for (kind, pkg), n in apps.items()), key=lambda x: x[2].lower())
+
+    def uninstall_loaded(self, items):
+        if isinstance(items, Exception):
+            items = []
+        self.un_items = self.un_cache = items
+        old = {k: v.get() for k, v in self.u_vars.items()}
+        self.u_vars = {(kind, pkg): tk.BooleanVar(value=old.get((kind, pkg), False)) for kind, pkg, _n in items}
+        self.render_uninstall()
+
+    def render_uninstall(self):
+        if not hasattr(self, "un_list") or not self.un_list.winfo_exists():
+            return
+        for w in self.un_list.winfo_children():
+            w.destroy()
+        q = self.un_filter.get().strip().lower()
+        shown = 0
+        for kind, pkg, name in self.un_items:
+            if q and q not in name.lower() and q not in pkg.lower():
+                continue
+            shown += 1
+            row = tk.Frame(self.un_list, bg=self.P["surface"])
+            row.pack(fill="x", padx=14, pady=2)
+            ttk.Checkbutton(row, text=name, variable=self.u_vars[(kind, pkg)]).pack(side="left")
+            tag = "Flatpak" if kind == "flatpak" else "APT"
+            tk.Label(row, text=f"  {tag}: {pkg}", font=self.F["small"], fg=self.P["muted"], bg=self.P["surface"]).pack(side="left")
+        if not self.un_items:
+            self.label(self.un_list, "No removable applications found.", fg=self.P["muted"]).pack(anchor="w", padx=14, pady=12)
+        self.un_info.config(text=f"{shown} of {len(self.un_items)} applications")
+
+    def uninstall_software(self):
+        sel = [k for k, v in self.u_vars.items() if v.get()]
+        if not sel:
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        debs = [p for k, p in sel if k == "deb"]
+        fps = [p for k, p in sel if k == "flatpak"]
+        cmds = []
+        if debs:
+            cmds += ["step 'Removing APT packages - check the list of removed packages before confirming'",
+                     f"apt-get purge {' '.join(shlex.quote(d) for d in debs)}", "apt-get autoremove --purge"]
+        if fps:
+            cmds += ["step 'Removing Flatpak applications'",
+                     f"flatpak uninstall -y --noninteractive {' '.join(shlex.quote(f) for f in fps)}",
+                     "flatpak uninstall --unused -y --noninteractive"]
+        if self.run_root("Uninstall Software", cmds, confirm=f"Remove {len(sel)} application(s)?\n\n" + "\n".join(p for _k, p in sel[:30])):
+            for k in sel:
+                self.u_vars[k].set(False)
+
+    # =======================================================================
+    # Desktops & window managers
+    # =======================================================================
+    def page_desktops(self):
+        body, actions = self.new_page("desktops")
+        P = self.P
+        current = os.environ.get("XDG_CURRENT_DESKTOP", "unknown")
+        c = self.card(body, "Desktop Environments",
+                      f"Current session: {current}.  Full = complete Debian task with apps · Minimal = desktop with basic apps · "
+                      "Core = bare desktop + login manager.  Remove purges matching packages (you confirm in the terminal).")
+        self.de_vars = {}
+        for name, cfg in DE_COMMANDS.items():
+            row = tk.Frame(c, bg=P["surface"])
+            row.pack(fill="x", pady=4)
+            left = tk.Frame(row, bg=P["surface"], width=240)
+            left.pack(side="left", fill="y")
+            left.pack_propagate(False)
+            self.label(left, f"🖥️ {name}", "h3").pack(anchor="w")
+            self.label(left, cfg["desc"], "small", fg=P["muted"]).pack(anchor="w")
+            v = tk.StringVar(value="none")
+            self.de_vars[name] = v
+            for txt, val in (("None", "none"), ("Full", "full"), ("Minimal", "minimal"), ("Core", "core"), ("Remove", "remove")):
+                ttk.Radiobutton(row, text=txt, variable=v, value=val).pack(side="left", padx=6)
+
+        c = self.card(body, "Window Managers", "Lightweight alternatives. Choose the session on your login screen after installing.")
+        self.wm_vars = {}
+        for name, cfg in WM_COMMANDS.items():
+            row = tk.Frame(c, bg=P["surface"])
+            row.pack(fill="x", pady=4)
+            left = tk.Frame(row, bg=P["surface"], width=240)
+            left.pack(side="left", fill="y")
+            left.pack_propagate(False)
+            self.label(left, f"🪟 {name}", "h3").pack(anchor="w")
+            self.label(left, cfg["desc"], "small", fg=P["muted"]).pack(anchor="w")
+            v = tk.StringVar(value="none")
+            self.wm_vars[name] = v
+            for txt, val in (("None", "none"), ("Install", "install"), ("Remove", "remove")):
+                ttk.Radiobutton(row, text=txt, variable=v, value=val).pack(side="left", padx=6)
+        self.button(actions, "Apply Changes", self.apply_desktops, "primary").pack(side="left")
+
+    @staticmethod
+    def purge_regex_cmd(regex):
+        return (f"PKGS=$(dpkg-query -W -f='${{Package}}\\t${{db:Status-Abbrev}}\\n' | awk -F'\\t' '$2 ~ /^ii/ && $1 ~ /{regex}/ {{print $1}}')",
+                "if [ -n \"$PKGS\" ]; then apt-get purge $PKGS; apt-get autoremove --purge; else ok 'Nothing to remove.'; fi")
+
+    def apply_desktops(self):
+        cmds, summary = [], []
+        for name, v in self.de_vars.items():
+            act = v.get()
+            cfg = DE_COMMANDS[name]
+            if act in ("full", "minimal", "core"):
+                cmds += [f"step {shlex.quote(f'Installing {name} ({act})')}", f"apt_install {cfg[act]}", "systemctl set-default graphical.target"]
+                summary.append(f"Install {name} ({act})")
+            elif act == "remove":
+                cmds += [f"step {shlex.quote(f'Removing {name}')}", *self.purge_regex_cmd(cfg["rm"])]
+                summary.append(f"Remove {name}")
+        for name, v in self.wm_vars.items():
+            act = v.get()
+            cfg = WM_COMMANDS[name]
+            if act == "install":
+                summary.append(f"Install {name}")
+                if name == "qtile":
+                    cmds += ["step 'Installing Qtile in /opt/qtile'",
+                             "apt_install python3-venv python3-dev build-essential libpangocairo-1.0-0 libxkbcommon-dev xinit xterm",
+                             "python3 -m venv /opt/qtile && /opt/qtile/bin/pip install --upgrade pip && /opt/qtile/bin/pip install 'qtile[widgets]' xcffib cairocffi",
+                             "ln -sf /opt/qtile/bin/qtile /usr/local/bin/qtile",
+                             "printf '[Desktop Entry]\\nName=Qtile\\nComment=Qtile Session\\nExec=/usr/local/bin/qtile start\\nType=Application\\nKeywords=wm;tiling\\n' > /usr/share/xsessions/qtile.desktop"]
+                else:
+                    cmds += [f"step {shlex.quote(f'Installing {name}')}", f"apt_install {cfg['pkgs']}"]
+            elif act == "remove":
+                summary.append(f"Remove {name}")
+                if name == "qtile":
+                    cmds += ["rm -rf /opt/qtile /usr/local/bin/qtile /usr/share/xsessions/qtile.desktop", "ok 'Qtile removed.'"]
+                else:
+                    cmds += [f"step {shlex.quote(f'Removing {name}')}", *self.purge_regex_cmd(cfg["rm"])]
+        if not cmds:
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        cmds = ["apt_update"] + cmds
+        self.run_root("Desktops & Window Managers", cmds, confirm="Apply these changes?\n\n• " + "\n• ".join(summary))
+
+    # =======================================================================
+    # Kernels
+    # =======================================================================
+    def page_kernels(self):
+        body, actions = self.new_page("kernels", scroll=False)
+        P = self.P
+        nb = ttk.Notebook(body)
+        nb.pack(fill="both", expand=True)
+        t1 = tk.Frame(nb, bg=P["bg"])
+        t2 = tk.Frame(nb, bg=P["bg"])
+        nb.add(t1, text="  Install Kernels  ")
+        nb.add(t2, text="  Installed Kernels  ")
+
+        sa = self.scroll_area(t1)
+        lvl = f"x86-64-v{self.cpu_level}" if self.cpu_level else f"not x86-64 ({self.sys['arch']})"
+        notes = f"Your CPU supports: {lvl}.   Running kernel: {os.uname().release}."
+        if self.secure_boot:
+            notes += "\n⚠ Secure Boot is ENABLED: third-party and self-compiled kernels are unsigned and will not boot unless you disable Secure Boot or sign them yourself."
+        c = self.card(sa, "Available Kernels", notes)
+        self.kernel_vars = {}
+        for key, title, desc, level in KERNELS:
+            v = tk.BooleanVar()
+            self.kernel_vars[key] = v
+            badges = []
+            if level and self.cpu_level and level == self.cpu_level and key.startswith("xanmod-x64"):
+                badges.append((self.t("recommended"), P["success"]))
+            if level and self.cpu_level and level > self.cpu_level:
+                badges.append(("CPU not supported", P["danger"]))
+            if key == "debian_backports" and self.sys["branch"] != "stable":
+                badges.append(("Stable only", P["warning"]))
+            self.check(c, v, title, desc.replace("<stable>", self.sys["debian_codename"] or STABLE_CODENAME), badges, style="Item.TCheckbutton")
+
+        top = tk.Frame(t2, bg=P["bg"])
+        top.pack(fill="x", pady=8)
+        self.k_curr = tk.Label(top, text="", font=self.F["bold"], fg=P["success"], bg=P["bg"])
+        self.k_curr.pack(side="left")
+        outer = tk.Frame(t2, bg=P["surface"], highlightbackground=P["border"], highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        self.k_list = self.scroll_area(outer, bg=P["surface"])
+        self.k_del_vars = {}
+        kb = tk.Frame(t2, bg=P["bg"])
+        kb.pack(fill="x", pady=(8, 0))
+        self.button(kb, "Remove Selected Kernels", self.remove_kernels, "danger").pack(side="left")
+        self.button(kb, self.t("refresh"), self.refresh_kernels, "secondary").pack(side="left", padx=8)
+
+        self.button(actions, "Install Selected Kernels", self.install_kernels, "primary").pack(side="left")
+        self.button(actions, "Update GRUB", lambda: self.run_root("Update GRUB", ["update-grub"]), "secondary").pack(side="left", padx=8)
+
+    def on_show_kernels(self):
+        self.refresh_kernels()
+
+    def refresh_kernels(self):
+        P = self.P
+        curr = os.uname().release
+        self.k_curr.config(text=f"Running kernel: {curr}  (protected)")
+        for w in self.k_list.winfo_children():
+            w.destroy()
+        self.k_del_vars.clear()
+        out = run_cmd(["dpkg-query", "-W", "-f=${Package}\t${db:Status-Abbrev}\t${Version}\t${Installed-Size}\n", "linux-image-*"], timeout=20)
+        rows = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4 or not parts[1].startswith("ii"):
+                continue
+            pkg, _st, ver, size = parts
+            if not re.match(r"^linux-image-\d", pkg):
+                continue  # meta packages (linux-image-amd64 ...) keep the system updated
+            rows.append((pkg, ver, size))
+        removable = 0
+        for pkg, ver, size in sorted(rows, reverse=True):
+            running = curr in pkg
+            r = tk.Frame(self.k_list, bg=P["surface"])
+            r.pack(fill="x", padx=14, pady=3)
+            if running:
+                tk.Label(r, text=f"● {pkg}", font=self.F["bold"], fg=P["success"], bg=P["surface"]).pack(side="left")
+                tk.Label(r, text="  running", font=self.F["small"], fg=P["muted"], bg=P["surface"]).pack(side="left")
+            else:
+                v = tk.BooleanVar()
+                self.k_del_vars[pkg] = v
+                ttk.Checkbutton(r, text=pkg, variable=v).pack(side="left")
+                removable += 1
+            mb = int(size) // 1024 if size.isdigit() else 0
+            tk.Label(r, text=f"   {ver}  ·  {mb} MB", font=self.F["small"], fg=P["muted"], bg=P["surface"]).pack(side="left")
+        if not rows:
+            self.label(self.k_list, "No versioned kernel packages found.", fg=P["muted"]).pack(anchor="w", padx=14, pady=12)
+        elif not removable:
+            self.label(self.k_list, "Only the running kernel is installed - nothing to remove.", fg=P["muted"]).pack(anchor="w", padx=14, pady=12)
+
+    def remove_kernels(self):
+        sel = [k for k, v in self.k_del_vars.items() if v.get()]
+        if not sel:
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        remaining = len(self.k_del_vars) - len(sel)
+        warn = "" if remaining > 0 else "\n\nNote: only the running kernel will remain. Consider keeping one fallback kernel."
+        pkgs = []
+        for img in sel:
+            pkgs.append(img)
+            version = img[len("linux-image-"):].replace("-unsigned", "")
+            pkgs.append(f"linux-headers-{version}")
+        cmds = ["step 'Removing kernels'",
+                "PKGS=''",
+                f"for p in {' '.join(shlex.quote(p) for p in pkgs)}; do is_installed \"$p\" && PKGS=\"$PKGS $p\"; done",
+                "apt-get purge -y $PKGS", "apt-get autoremove --purge -y",
+                "if command -v update-grub >/dev/null; then update-grub; fi"]
+        self.run_root("Remove Kernels", cmds, confirm=f"Remove {len(sel)} kernel(s)?\n\n" + "\n".join(sel) + warn)
+
+    def install_kernels(self):
+        sel = [k for k, v in self.kernel_vars.items() if v.get()]
+        if not sel:
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        cmds = ["apt_update", "ensure_pkg curl wget gpg ca-certificates"]
+        xan = [k for k in sel if k.startswith("xanmod")]
+        if "debian_backports" in sel:
+            cmds += ["step 'Installing the Debian backports kernel'",
+                     "if [ \"$BRANCH\" != stable ] && [ \"$BRANCH\" != oldstable ]; then warn 'Backports are only for Debian Stable/Oldstable - skipped.'; else "
+                     "if ! grep -rqs \"$DEBIAN_CODENAME-backports\" /etc/apt/sources.list /etc/apt/sources.list.d/; then "
+                     "printf 'Types: deb\\nURIs: https://deb.debian.org/debian\\nSuites: %s-backports\\nComponents: main contrib non-free non-free-firmware\\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\\n' \"$DEBIAN_CODENAME\" > /etc/apt/sources.list.d/debos-backports.sources; apt_update; fi; "
+                     "apt-get install -y -t \"$DEBIAN_CODENAME-backports\" \"linux-image-$ARCH\" \"linux-headers-$ARCH\"; fi"]
+        if xan:
+            cmds += ["step 'Adding the XanMod repository'",
+                     "need_arch amd64 && add_key https://dl.xanmod.org/archive.key /etc/apt/keyrings/xanmod-archive-keyring.gpg && "
+                     "echo \"deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $REPO_CODENAME main non-free\" > /etc/apt/sources.list.d/xanmod-release.list && "
+                     "rm -f /etc/apt/sources.list.d/xanmod.list && apt_update"]
+            for k in xan:
+                cmds += [f"step 'Installing linux-{k}'", f"apt_install linux-{k}"]
+        if "liquorix" in sel:
+            cmds += ["step 'Installing Liquorix'",
+                     "need_arch amd64 && curl -fsSL https://liquorix.net/install-liquorix.sh | bash"]
+        if "linux-libre" in sel:
+            cmds += ["step 'Installing Linux-libre (freesh)'",
+                     "BASE=https://linux-libre.fsfla.org/pub/linux-libre/freesh/pool/main/f/freesh-archive-keyring/",
+                     "KR=$(curl -fsSL \"$BASE\" | grep -oE 'freesh-archive-keyring_[0-9.]+_all\\.deb' | sort -uV | tail -n1)",
+                     "if [ -n \"$KR\" ]; then wget -qO /tmp/freesh.deb \"$BASE$KR\" && apt_install /tmp/freesh.deb && apt_update && apt_install linux-libre; rm -f /tmp/freesh.deb; else fail 'Could not find the freesh keyring package.'; fi"]
+        for moniker in ("stable", "longterm"):
+            if f"mainline_{moniker}" in sel:
+                cmds += self.mainline_cmds(moniker)
+        cmds += ["if command -v update-grub >/dev/null; then step 'Updating GRUB'; update-grub; fi",
+                 "ok 'Reboot and pick the new kernel from the GRUB menu (Advanced options).'"]
+        msg = "Install the selected kernel(s)?"
+        if self.secure_boot and any(k != "debian_backports" for k in sel):
+            msg += "\n\n⚠ Secure Boot is enabled. These kernels are not signed by Debian and will be refused at boot until Secure Boot is disabled."
+        self.run_root("Install Kernels", cmds, confirm=msg)
+
+    def mainline_cmds(self, moniker):
+        py = ("import sys,json; d=json.load(sys.stdin); "
+              f"r=next(x for x in d['releases'] if x['moniker']=='{moniker}'); print(r['version'], r['source'])")
+        return [
+            f"step 'Building Linux mainline ({moniker}) from kernel.org - this can take a long time'",
+            "ensure_pkg build-essential bc bison flex libssl-dev libelf-dev libncurses-dev dwarves rsync cpio kmod python3 xz-utils debhelper",
+            f"read -r KVER KSRC < <(curl -fsSL https://www.kernel.org/releases.json | python3 -c {shlex.quote(py)})",
+            "if [ -z \"$KSRC\" ]; then fail 'Could not read kernel.org release information.'; else",
+            "  KBUILD=/usr/local/src/debos-kernel; mkdir -p \"$KBUILD\" && cd \"$KBUILD\"",
+            "  echo \"Kernel $KVER: $KSRC\"",
+            "  wget -c -O \"linux-$KVER.tar.xz\" \"$KSRC\" && rm -rf \"linux-$KVER\" && tar -xf \"linux-$KVER.tar.xz\" && cd \"linux-$KVER\"",
+            "  cp \"/boot/config-$(uname -r)\" .config",
+            "  scripts/config --disable SYSTEM_TRUSTED_KEYS --disable SYSTEM_REVOCATION_KEYS --set-str SYSTEM_TRUSTED_KEYS '' --set-str SYSTEM_REVOCATION_KEYS '' --disable DEBUG_INFO --enable DEBUG_INFO_NONE",
+            "  make olddefconfig",
+            "  if make -j\"$(nproc)\" bindeb-pkg LOCALVERSION=-debos; then",
+            "    DEBS=(); for d in ../linux-image-*\"$KVER\"*debos*.deb ../linux-headers-*\"$KVER\"*debos*.deb; do case \"$d\" in *-dbg_*) ;; *) [ -f \"$d\" ] && DEBS+=(\"$d\") ;; esac; done",
+            "    apt_install \"${DEBS[@]}\"",
+            "    ok \"Kernel $KVER built and installed. Packages are in $KBUILD.\"",
+            "  else fail 'Kernel build failed - see the output above.'; fi",
+            "  cd /tmp",
+            "fi",
+        ]
+
+    # =======================================================================
+    # Drivers & hardware
+    # =======================================================================
+    DRIVER_OPTIONS = [
+        ("nvidia", "NVIDIA proprietary driver", "nvidia-driver + DKMS kernel module + headers. Best performance for GeForce/Quadro.", "Proprietary"),
+        ("nvidia_detect", "Run nvidia-detect", "Prints the recommended NVIDIA driver package for your card.", "Tool"),
+        ("nouveau", "Switch back to Nouveau (open NVIDIA)", "Purges the proprietary NVIDIA driver.", "Open Source"),
+        ("amd", "AMD graphics (Mesa, Vulkan, firmware)", "firmware-amd-graphics, Mesa, RADV Vulkan, VA-API.", "Open Source"),
+        ("intel", "Intel graphics (Mesa, Vulkan, media driver)", "Mesa, ANV Vulkan, intel-media-va-driver-non-free.", "Open Source"),
+        ("firmware", "Wi-Fi / Bluetooth firmware", "firmware-linux-nonfree, iwlwifi, realtek, atheros, misc.", "Non-Free"),
+        ("broadcom", "Broadcom Wi-Fi (broadcom-sta)", "For BCM43xx chips not supported by brcmfmac/b43.", "Proprietary"),
+        ("microcode", "CPU microcode updates", "intel-microcode or amd64-microcode for your CPU (security & stability fixes).", "Non-Free"),
+        ("bluetooth", "Bluetooth stack", "bluez + Blueman manager.", "Open Source"),
+        ("printing", "Printers", "CUPS, printer drivers and configuration tool.", "Open Source"),
+        ("scanner", "Scanners", "SANE and Simple Scan.", "Open Source"),
+        ("fwupd", "Firmware updates (fwupd / LVFS)", "Update BIOS/UEFI, SSD and peripheral firmware.", "Open Source"),
+        ("i386", "32-bit support (multiarch i386)", "Needed by Steam and many Wine applications.", "System"),
+        ("vulkan", "Vulkan tools", "vulkan-tools and mesa-utils for testing 3D acceleration.", "Open Source"),
+    ]
+
+    def page_drivers(self):
+        body, actions = self.new_page("drivers")
+        P = self.P
+        c = self.card(body, "Detected Hardware")
+        self.hw_text = self.label(c, self.t("loading"), "mono", fg=P["text"], wraplength=900, anchor="w")
+        self.hw_text.pack(anchor="w", fill="x")
+        self.hw_reco = self.label(c, "", "bold", fg=P["info"])
+        self.hw_reco.pack(anchor="w", pady=(8, 0))
+        c = self.card(body, "Drivers & Firmware",
+                      "contrib, non-free and non-free-firmware are enabled automatically when needed.")
+        self.drv_vars = {}
+        colors = {"Proprietary": P["warning"], "Non-Free": P["warning"], "Open Source": P["success"], "Tool": P["info"], "System": P["info"]}
+        self.drv_rows = {}
+        for key, title, desc, cat in self.DRIVER_OPTIONS:
+            v = tk.BooleanVar()
+            self.drv_vars[key] = v
+            self.drv_rows[key] = self.check(c, v, title, desc, [(cat, colors[cat])], style="Item.TCheckbutton")
+        self.button(actions, "Apply Drivers", self.apply_drivers, "primary").pack(side="left")
+        self.button(actions, "Hardware Report (inxi)", lambda: self.run_root("Hardware report", ["ensure_pkg inxi", "inxi -Fxxz"]), "secondary").pack(side="left", padx=8)
+
+    def on_show_drivers(self):
+        def work():
+            lspci = run_cmd(["lspci"], timeout=10)
+            lsusb = run_cmd(["lsusb"], timeout=10)
+            pick = lambda text, pat: [re.sub(r"^\S+\s+", "", l) for l in text.splitlines() if re.search(pat, l, re.I)]
+            cpu = next((l.split(":", 1)[1].strip() for l in read_file("/proc/cpuinfo").splitlines() if l.startswith("model name")), "Unknown")
+            return {"CPU": [cpu], "GPU": pick(lspci, r"vga|3d|display"), "Network": pick(lspci, r"network|ethernet|wireless"),
+                    "Audio": pick(lspci, r"audio"), "Bluetooth": pick(lsusb, r"bluetooth"), "_raw": lspci + "\n" + cpu}
+
+        def done(hw):
+            if isinstance(hw, Exception) or not self.hw_text.winfo_exists():
+                return
+            lines = []
+            for key in ("CPU", "GPU", "Network", "Audio", "Bluetooth"):
+                vals = hw.get(key) or ["not detected"]
+                lines.append(f"{key + ':':<11}{vals[0]}")
+                lines += [" " * 11 + v for v in vals[1:]]
+            lines.append(f"{'Boot:':<11}{'UEFI' if os.path.isdir('/sys/firmware/efi') else 'Legacy BIOS'}, Secure Boot {'ON' if self.secure_boot else 'off'}")
+            self.hw_text.config(text="\n".join(lines))
+            raw = hw["_raw"].lower()
+            reco = []
+            gpu = " ".join(hw.get("GPU", [])).lower()
+            if "nvidia" in gpu:
+                reco.append("nvidia")
+            if re.search(r"\bamd\b|ati|radeon", gpu):
+                reco.append("amd")
+            if "intel" in gpu:
+                reco.append("intel")
+            if "broadcom" in raw and re.search(r"network|wireless", raw):
+                reco.append("broadcom")
+            if re.search(r"realtek|intel.*(wireless|wi-fi)|atheros|qualcomm|mediatek", raw):
+                reco.append("firmware")
+            reco.append("microcode")
+            for key in reco:
+                row = self.drv_rows.get(key)
+                if row:
+                    tk.Label(row.winfo_children()[0], text=f" {self.t('recommended')} ", font=self.F["small"], fg="#FFFFFF", bg=self.P["accent"]).pack(side="left", padx=6)
+            self.hw_reco.config(text="Recommended for this machine: " + ", ".join(dict.fromkeys(reco)))
+        if not getattr(self, "_hw_scanned", False):
+            self._hw_scanned = True
+            self.in_thread(work, done)
+
+    def apply_drivers(self):
+        sel = [k for k, v in self.drv_vars.items() if v.get()]
+        if not sel:
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        cmds = ["backup_apt_sources", "enable_components", "apt_update"]
+        if "i386" in sel:
+            cmds += ["step 'Enabling 32-bit (i386) packages'", "dpkg --add-architecture i386", "apt_update",
+                     "apt_install libgl1-mesa-dri:i386 libglx-mesa0:i386 mesa-vulkan-drivers:i386"]
+        if "nvidia_detect" in sel:
+            cmds += ["step 'nvidia-detect'", "ensure_pkg nvidia-detect", "nvidia-detect || true"]
+        if "nvidia" in sel:
+            cmds += ["step 'Installing the NVIDIA driver'",
+                     "apt_install \"linux-headers-$(uname -r)\" || apt_install \"linux-headers-$ARCH\"",
+                     "apt_install nvidia-kernel-dkms nvidia-driver firmware-misc-nonfree",
+                     "[ -d /sys/firmware/efi ] && command -v mokutil >/dev/null && mokutil --sb-state 2>/dev/null | grep -q enabled && "
+                     "warn 'Secure Boot is on: you may be asked to enroll a MOK key at next boot for the NVIDIA module.' || true"]
+        if "nouveau" in sel:
+            cmds += ["step 'Switching to Nouveau'",
+                     "PKGS=$(dpkg-query -W -f='${Package}\\t${db:Status-Abbrev}\\n' | awk -F'\\t' '$2 ~ /^ii/ && $1 ~ /^(nvidia-|libnvidia-|xserver-xorg-video-nvidia)/ {print $1}')",
+                     "[ -n \"$PKGS\" ] && apt-get purge -y $PKGS", "apt_install xserver-xorg-video-nouveau libgl1-mesa-dri",
+                     "rm -f /etc/modprobe.d/nvidia-blacklists-nouveau.conf", "update-initramfs -u"]
+        if "amd" in sel:
+            cmds += ["step 'Installing AMD graphics stack'", "apt_install firmware-amd-graphics libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers mesa-va-drivers xserver-xorg-video-amdgpu"]
+        if "intel" in sel:
+            cmds += ["step 'Installing Intel graphics stack'", "apt_install libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers intel-media-va-driver-non-free firmware-misc-nonfree"]
+        if "firmware" in sel:
+            cmds += ["step 'Installing firmware'", "apt_install firmware-linux firmware-linux-nonfree firmware-iwlwifi firmware-realtek firmware-atheros firmware-misc-nonfree"]
+        if "broadcom" in sel:
+            cmds += ["step 'Installing Broadcom drivers'", "apt_install \"linux-headers-$(uname -r)\" broadcom-sta-dkms firmware-brcm80211",
+                     "modprobe -r b44 b43 b43legacy ssb brcmsmac bcma 2>/dev/null || true", "modprobe wl || true"]
+        if "microcode" in sel:
+            cmds += ["step 'Installing CPU microcode'",
+                     "if grep -q GenuineIntel /proc/cpuinfo; then apt_install intel-microcode; elif grep -q AuthenticAMD /proc/cpuinfo; then apt_install amd64-microcode; else warn 'No x86 microcode needed for this CPU.'; fi"]
+        if "bluetooth" in sel:
+            cmds += ["step 'Installing Bluetooth'", "apt_install bluez blueman", "systemctl enable --now bluetooth"]
+        if "printing" in sel:
+            cmds += ["step 'Installing printing support'", "apt_install cups printer-driver-all system-config-printer",
+                     "systemctl enable --now cups", "usermod -aG lpadmin \"$TARGET_USER\""]
+        if "scanner" in sel:
+            cmds += ["step 'Installing scanner support'", "apt_install sane-utils simple-scan", "usermod -aG scanner \"$TARGET_USER\""]
+        if "fwupd" in sel:
+            cmds += ["step 'Firmware updates'", "ensure_pkg fwupd", "fwupdmgr refresh --force || true", "fwupdmgr get-updates || true",
+                     "fwupdmgr update || true"]
+        if "vulkan" in sel:
+            cmds += ["apt_install vulkan-tools mesa-utils", "vulkaninfo --summary 2>/dev/null | head -n 30 || true"]
+        cmds += ["ok 'Reboot to load new drivers and firmware.'"]
+        self.run_root("Drivers & Hardware", cmds)
+
+    # =======================================================================
+    # Network
+    # =======================================================================
+    def page_network(self):
+        body, _actions = self.new_page("network")
+        P = self.P
+        c = self.card(body, "Network Information")
+        self.net_info = self.label(c, self.t("loading"), "mono", wraplength=900, anchor="w")
+        self.net_info.pack(anchor="w", fill="x")
+        self.button_row(c, [
+            ("Refresh / Show Public IP", lambda: self.load_network(True), "primary"),
+            ("Speed Test", lambda: self.run_root("Speed test", ["ensure_pkg speedtest-cli", "sudo -u \"$TARGET_USER\" speedtest-cli --secure"])),
+            ("Ping Test", lambda: self.run_root("Ping test", ["ping -c 4 deb.debian.org", "ping -c 4 1.1.1.1"])),
+            ("Wi-Fi Scan & LAN Hosts", self.wifi_scan),
+        ])
+
+        c = self.card(body, "DNS Servers", "Applied to the active NetworkManager connection.")
+        row = tk.Frame(c, bg=P["surface"])
+        row.pack(anchor="w")
+        self.dns_var = tk.StringVar(value="Cloudflare")
+        ttk.Combobox(row, textvariable=self.dns_var, values=list(DNS_PRESETS), state="readonly", width=28).pack(side="left")
+        self.button(row, "Apply DNS", self.apply_dns, "primary").pack(side="left", padx=8)
+        self.button(row, "Flush DNS cache", lambda: self.run_root("Flush DNS", [
+            "if command -v resolvectl >/dev/null; then resolvectl flush-caches && ok 'DNS cache flushed.'; else warn 'systemd-resolved is not in use; nothing to flush.'; fi"]), "secondary").pack(side="left")
+
+        c = self.card(body, "Connections")
+        self.button_row(c, [
+            ("Network Manager (nmtui)", lambda: self.run_root("nmtui", ["ensure_pkg network-manager", "nmtui"], pause=False)),
+            ("Show Saved Wi-Fi Passwords", lambda: self.run_root("Saved Wi-Fi passwords", [
+                "nmcli -t -f NAME,TYPE connection show | awk -F: '$2 ~ /wireless/ {print $1}' | while read -r n; do "
+                "printf '%-32s %s\\n' \"$n\" \"$(nmcli -s -g 802-11-wireless-security.psk connection show \"$n\" 2>/dev/null)\"; done"])),
+            ("Edit /etc/hosts", lambda: self.run_root("Edit hosts", ["${EDITOR:-nano} /etc/hosts"], pause=False)),
+            ("Restart NetworkManager", lambda: self.run_root("Restart NetworkManager", ["systemctl restart NetworkManager && ok 'Restarted.'"])),
+        ])
+        hrow = tk.Frame(c, bg=P["surface"])
+        hrow.pack(anchor="w", pady=(6, 0))
+        self.label(hrow, "Hostname:").pack(side="left")
+        self.host_var = tk.StringVar(value=os.uname().nodename)
+        self.entry(hrow, self.host_var, 24).pack(side="left", padx=8)
+        self.button(hrow, "Change Hostname", self.change_hostname, "secondary").pack(side="left")
+
+        c = self.card(body, "Firewall (UFW)")
+        self.button_row(c, [
+            ("Enable Firewall", lambda: self.run_root("Enable UFW", ["ensure_pkg ufw", "ufw default deny incoming", "ufw default allow outgoing", "ufw --force enable", "ufw status verbose"]), "primary"),
+            ("Disable Firewall", lambda: self.run_root("Disable UFW", ["ufw disable"])),
+            ("Status", lambda: self.run_root("UFW status", ["ensure_pkg ufw", "ufw status verbose"])),
+            ("Install Gufw (GUI)", lambda: self.run_root("Gufw", ["apt_install gufw"])),
+        ])
+
+        c = self.card(body, "Remote Access")
+        self.button_row(c, [
+            ("Enable SSH Server", lambda: self.run_root("SSH server", ["apt_install openssh-server", "systemctl enable --now ssh",
+                                                                       "command -v ufw >/dev/null && ufw allow OpenSSH || true", "ok \"Connect with: ssh $TARGET_USER@$(hostname -I | awk '{print $1}')\""])),
+            ("Set up RDP Server (XFCE)", self.setup_rdp),
+            ("Install Remmina (client)", lambda: self.run_root("Remmina", ["apt_install remmina remmina-plugin-rdp remmina-plugin-vnc"])),
+        ])
+
+        c = self.card(body, "MAC Address Changer", "Randomizing the MAC briefly disconnects the interface.")
+        row = tk.Frame(c, bg=P["surface"])
+        row.pack(anchor="w")
+        self.label(row, "Interface:").pack(side="left")
+        self.iface_var = tk.StringVar()
+        self.mac_cb = ttk.Combobox(row, textvariable=self.iface_var, state="readonly", width=18)
+        self.mac_cb.pack(side="left", padx=8)
+        self.button(row, "Randomize MAC", lambda: self.mac_action("-r"), "primary").pack(side="left", padx=(0, 8))
+        self.button(row, "Restore Original", lambda: self.mac_action("-p"), "secondary").pack(side="left")
+
+    def on_show_network(self):
+        try:
+            ifaces = sorted(i for i in os.listdir("/sys/class/net") if i != "lo")
+        except Exception:
+            ifaces = []
+        self.mac_cb["values"] = ifaces
+        if ifaces and not self.iface_var.get():
+            self.iface_var.set(ifaces[0])
+        self.load_network(False)
+
+    def load_network(self, public):
+        self.net_info.config(text=self.t("loading"))
+
+        def work():
+            lines = []
+            for line in run_cmd(["ip", "-o", "-4", "addr", "show"]).splitlines():
+                parts = line.split()
+                if len(parts) > 3 and parts[1] != "lo":
+                    lines.append(f"{parts[1] + ':':<14}{parts[3]}")
+            for line in run_cmd(["ip", "-o", "-6", "addr", "show", "scope", "global"]).splitlines():
+                parts = line.split()
+                if len(parts) > 3:
+                    lines.append(f"{parts[1] + ':':<14}{parts[3]}")
+            gw = run_cmd(["ip", "route", "show", "default"]).split("\n")[0]
+            lines.append(f"{'Gateway:':<14}{gw or 'none'}")
+            dns = [l.split()[1] for l in read_file("/etc/resolv.conf").splitlines() if l.startswith("nameserver") and len(l.split()) > 1]
+            lines.append(f"{'DNS:':<14}{', '.join(dns) or 'unknown'}")
+            if shutil.which("nmcli"):
+                act = run_cmd(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+                if act:
+                    lines.append(f"{'Active:':<14}" + "; ".join(a.replace(":", " / ") for a in act.splitlines() if not a.endswith(":lo")))
+            if public:
+                ip = run_cmd(["curl", "-s", "--max-time", "6", "https://ifconfig.me"], timeout=8)
+                lines.append(f"{'Public IP:':<14}{ip or 'unavailable'}")
+            return "\n".join(lines) or "No network interfaces found."
+        self.in_thread(work, lambda r: self.net_info.winfo_exists() and self.net_info.config(text=str(r)))
+
+    def wifi_scan(self):
+        self.run_root("Wi-Fi scan", [
+            "ensure_pkg network-manager iw rfkill nmap",
+            "rfkill unblock wifi || true",
+            "step 'Available Wi-Fi networks'", "nmcli device wifi rescan 2>/dev/null; sleep 2; nmcli device wifi list",
+            "step 'Hosts on your local network'",
+            "IFACE=$(ip route show default | awk '{for(i=1;i<=NF;i++) if($i==\"dev\") print $(i+1)}' | head -n1)",
+            "SUBNET=$(ip -o -4 addr show dev \"$IFACE\" 2>/dev/null | awk '{print $4}' | head -n1)",
+            "if [ -n \"$SUBNET\" ]; then echo \"Scanning $SUBNET on $IFACE...\"; nmap -sn \"$SUBNET\"; else warn 'No active IPv4 network found.'; fi",
+        ])
+
+    def apply_dns(self):
+        name = self.dns_var.get()
+        v4, v6 = DNS_PRESETS.get(name, ("", ""))
+        con = "CON=$(nmcli -t -f NAME,DEVICE connection show --active | grep -v ':lo$' | head -n1 | cut -d: -f1)"
+        if v4:
+            mod = (f"nmcli connection modify \"$CON\" ipv4.dns {shlex.quote(v4)} ipv4.ignore-auto-dns yes "
+                   f"ipv6.dns {shlex.quote(v6)} ipv6.ignore-auto-dns yes")
+        else:
+            mod = "nmcli connection modify \"$CON\" ipv4.dns '' ipv4.ignore-auto-dns no ipv6.dns '' ipv6.ignore-auto-dns no"
+        self.run_root(f"DNS: {name}", [
+            "ensure_pkg network-manager", con,
+            "if [ -z \"$CON\" ]; then fail 'No active NetworkManager connection.'; else",
+            f"  {mod} && nmcli connection up \"$CON\" && ok \"DNS for '$CON' set to {name}.\"", "fi",
+            "sleep 1; grep nameserver /etc/resolv.conf || true"])
+
+    def change_hostname(self):
+        name = self.host_var.get().strip().lower()
+        if not re.match(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", name):
+            return messagebox.showerror(APP_NAME, "Invalid hostname. Use letters, digits and hyphens (max 63 characters).")
+        old = os.uname().nodename
+        self.run_root("Change hostname", [
+            f"hostnamectl set-hostname {name}",
+            f"if grep -qE '^127\\.0\\.1\\.1' /etc/hosts; then sed -i -E 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t{name}/' /etc/hosts; else echo -e '127.0.1.1\\t{name}' >> /etc/hosts; fi",
+            f"ok 'Hostname changed from {old} to {name}.'"])
+
+    def setup_rdp(self):
+        self.run_root("RDP Server", [
+            "apt_install xfce4 xfce4-goodies xrdp",
+            "adduser xrdp ssl-cert 2>/dev/null || true",
+            "echo 'xfce4-session' > /etc/skel/.xsession",
+            "sudo -u \"$TARGET_USER\" sh -c 'echo xfce4-session > \"$HOME/.xsession\"'",
+            "systemctl enable xrdp && systemctl restart xrdp",
+            "command -v ufw >/dev/null && ufw allow 3389/tcp || true",
+            "ok \"RDP server ready. Connect to $(hostname -I | awk '{print $1}'):3389 with Remmina or Windows Remote Desktop.\"",
+            "warn 'Log out of your local session before connecting with the same user.'"],
+            confirm="Install XFCE and the xrdp server and open port 3389?")
+
+    def mac_action(self, flag):
+        iface = self.iface_var.get()
+        if not iface or not re.match(r"^[A-Za-z0-9_.:-]+$", iface):
+            return messagebox.showwarning(APP_NAME, "Select a network interface first.")
+        self.run_root("MAC changer", [
+            "echo 'macchanger macchanger/automatically_run boolean false' | debconf-set-selections",
+            "DEBIAN_FRONTEND=noninteractive ensure_pkg macchanger",
+            f"ip link set dev {iface} down", f"macchanger {flag} {iface}", f"ip link set dev {iface} up"])
+
+    # =======================================================================
+    # Tweaks & tools
+    # =======================================================================
+    TWEAKS = [
+        ("zram", "Enable ZRAM compressed swap", "zram-tools with zstd, 50% of RAM. Great for low-memory systems.", False),
+        ("swappiness", "Lower swappiness to 10", "Keeps applications in RAM longer (/etc/sysctl.d/99-debos.conf).", False),
+        ("unattended", "Automatic security updates", "unattended-upgrades for Debian security fixes (recommended on Stable).", False),
+        ("fstrim", "Weekly SSD TRIM", "Enables fstrim.timer.", False),
+        ("earlyoom", "earlyoom", "Prevents total freezes when memory runs out.", False),
+        ("tlp", "TLP laptop power saving", "Better battery life (replaces power-profiles-daemon).", False),
+        ("timeshift", "Timeshift snapshots", "Install Timeshift to roll back after a bad upgrade.", False),
+        ("flathub", "Flatpak + Flathub + store plugin", "Adds Flathub and the GNOME Software / Discover Flatpak plugin.", False),
+        ("fonts", "Extra fonts", "Noto (all languages), color emoji, Liberation and Fira fonts.", False),
+        ("msfonts", "Microsoft core fonts", "Arial, Times New Roman, Verdana... (contrib, downloads at install).", False),
+        ("essentials", "Essential command-line tools", "curl, wget, git, htop, fastfetch, unzip, 7zip, bash-completion.", False),
+        ("archive", "Archive formats", "7-Zip, RAR, ZIP and more for your file manager.", False),
+        ("sudo_user", "Add your user to the sudo group", "Allows administrative tasks with your own password.", False),
+    ]
+
+    def page_tweaks(self):
+        body, actions = self.new_page("tweaks")
+        c = self.card(body, "System Tweaks")
+        self.tw_vars = {}
+        for key, title, desc, default in self.TWEAKS:
+            v = tk.BooleanVar(value=default)
+            self.tw_vars[key] = v
+            self.check(c, v, title, desc, style="Item.TCheckbutton")
+        self.button(actions, "Apply Tweaks", self.apply_tweaks, "primary").pack(side="left")
+
+        c = self.card(body, "Diagnostics & Logs")
+        self.button_row(c, [
+            ("Boot Errors", lambda: self.run_root("Boot errors", ["journalctl -b -p 3 --no-pager | tail -n 150"])),
+            ("Failed Services", lambda: self.run_root("Failed services", ["systemctl --failed --no-pager"])),
+            ("Boot Time", lambda: self.run_root("Boot time", ["systemd-analyze", "systemd-analyze blame --no-pager | head -n 25"])),
+            ("Disk Usage", lambda: self.run_root("Disk usage", ["df -hT -x tmpfs -x devtmpfs", "step 'Largest folders in /var and your home'",
+                                                                "du -xh --max-depth=1 /var \"$TARGET_HOME\" 2>/dev/null | sort -rh | head -n 20"])),
+            ("Debos Log", lambda: self.run_root("Debos log", [f"tail -n 300 {LOG_FILE} 2>/dev/null || echo 'No log yet.'"])),
+        ])
+        self.button_row(c, [
+            ("Hardware Report (inxi)", lambda: self.run_root("Hardware report", ["ensure_pkg inxi", "inxi -Fxxz"])),
+            ("Held / Foreign Packages", lambda: self.run_root("Package report", [
+                "step 'Held packages'", "apt-mark showhold", "step 'Packages not from a configured repository'",
+                "apt list --installed 2>/dev/null | grep -E ',local\\]|\\[installed,local\\]' || ok 'None'"])),
+            ("Open Terminal as Root", lambda: self.run_root("Root shell", ["warn 'You are root. Type exit to close.'", "bash -i"], pause=False)),
+        ])
+
+    def apply_tweaks(self):
+        v = {k: var.get() for k, var in self.tw_vars.items()}
+        if not any(v.values()):
+            return messagebox.showinfo(APP_NAME, self.t("nothing_selected"))
+        cmds = ["apt_update"]
+        if v["zram"]:
+            cmds += ["step 'Enabling ZRAM'", "apt_install zram-tools",
+                     "printf 'ALGO=zstd\\nPERCENT=50\\nPRIORITY=100\\n' > /etc/default/zramswap", "systemctl restart zramswap", "swapon --show"]
+        if v["swappiness"]:
+            cmds += ["step 'Setting swappiness to 10'", "echo 'vm.swappiness=10' > /etc/sysctl.d/99-debos.conf", "sysctl -p /etc/sysctl.d/99-debos.conf"]
+        if v["unattended"]:
+            cmds += ["step 'Enabling unattended security upgrades'",
+                     "[ \"$BRANCH\" = sid ] && warn 'Sid has no separate security archive; unattended-upgrades will only apply regular updates if configured.'",
+                     "apt_install unattended-upgrades apt-listchanges",
+                     "echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections",
+                     "DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive unattended-upgrades",
+                     "systemctl enable --now unattended-upgrades"]
+        if v["fstrim"]:
+            cmds += ["step 'Enabling weekly TRIM'", "systemctl enable --now fstrim.timer"]
+        if v["earlyoom"]:
+            cmds += ["step 'Installing earlyoom'", "apt_install earlyoom", "systemctl enable --now earlyoom"]
+        if v["tlp"]:
+            cmds += ["step 'Installing TLP'", "apt_install tlp tlp-rdw", "systemctl enable --now tlp"]
+        if v["timeshift"]:
+            cmds += ["step 'Installing Timeshift'", "apt_install timeshift"]
+        if v["flathub"]:
+            cmds += self.flatpak_setup_cmds(store_plugin=True)
+        if v["fonts"]:
+            cmds += ["step 'Installing fonts'", "apt_install fonts-noto fonts-noto-color-emoji fonts-liberation2 fonts-firacode fonts-dejavu", "fc-cache -f"]
+        if v["msfonts"]:
+            cmds += ["step 'Installing Microsoft core fonts'", "enable_components", "apt_update", "apt_install ttf-mscorefonts-installer"]
+        if v["essentials"]:
+            cmds += ["step 'Installing essential tools'", "apt_install curl wget git htop unzip p7zip-full bash-completion",
+                     "apt_install fastfetch 2>/dev/null || apt_install neofetch || true"]
+        if v["archive"]:
+            cmds += ["step 'Installing archive support'", "apt_install 7zip zip unzip xz-utils zstd || apt_install p7zip-full zip unzip",
+                     "enable_components", "apt_update", "apt_install unrar || true"]
+        if v["sudo_user"]:
+            cmds += ["step 'Adding user to sudo group'", "usermod -aG sudo \"$TARGET_USER\" && ok \"$TARGET_USER added to sudo. Log out and back in.\""]
+        self.run_root("Tweaks & Tools", cmds)
+
+    # =======================================================================
+    # Customizer: GRUB, Plymouth, login screen
+    # =======================================================================
+    def read_grub(self):
+        vals = {}
+        for line in read_file("/etc/default/grub").splitlines():
+            m = re.match(r"^\s*(GRUB_[A-Z_]+)=(.*)$", line)
+            if m:
+                vals[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+        return vals
+
+    def page_customizer(self):
+        body, _actions = self.new_page("customizer")
+        P = self.P
+        grub = self.read_grub()
+
+        c = self.card(body, "GRUB Bootloader", "Current values are read from /etc/default/grub. A backup is created before changes.")
+        g = tk.Frame(c, bg=P["surface"])
+        g.pack(anchor="w", fill="x")
+        self.g_to = tk.StringVar(value=grub.get("GRUB_TIMEOUT", "5"))
+        self.g_hid = tk.BooleanVar(value=grub.get("GRUB_TIMEOUT_STYLE") == "hidden")
+        self.g_osp = tk.BooleanVar(value=grub.get("GRUB_DISABLE_OS_PROBER", "true") == "false")
+        self.g_save = tk.BooleanVar(value=grub.get("GRUB_DEFAULT") == "saved")
+        self.g_quiet = tk.BooleanVar(value="quiet" in grub.get("GRUB_CMDLINE_LINUX_DEFAULT", "quiet"))
+        self.grub_color_normal = tk.StringVar(value=grub.get("GRUB_COLOR_NORMAL", "light-gray/black"))
+        self.grub_color_highlight = tk.StringVar(value=grub.get("GRUB_COLOR_HIGHLIGHT", "black/light-gray"))
+        self.g_bg = tk.StringVar(value=grub.get("GRUB_BACKGROUND", ""))
+        colors = ["black", "blue", "green", "cyan", "red", "magenta", "brown", "light-gray", "dark-gray", "light-blue",
+                  "light-green", "light-cyan", "light-red", "light-magenta", "yellow", "white"]
+        combos = [f"{a}/{b}" for a in colors for b in ("black", "blue", "light-gray", "dark-gray")]
+        rows = [
+            ("Timeout (seconds):", lambda p: self.entry(p, self.g_to, 6)),
+            ("Normal color (text/background):", lambda p: ttk.Combobox(p, textvariable=self.grub_color_normal, values=combos, width=22)),
+            ("Highlight color (text/background):", lambda p: ttk.Combobox(p, textvariable=self.grub_color_highlight, values=combos, width=22)),
+            ("Background image (PNG/JPG/TGA):", lambda p: self.entry(p, self.g_bg, 42)),
+        ]
+        for i, (lbl, mk) in enumerate(rows):
+            self.label(g, lbl).grid(row=i, column=0, sticky="w", pady=4)
+            mk(g).grid(row=i, column=1, sticky="w", padx=10)
+        self.button(g, "Browse…", lambda: self.pick_file(self.g_bg, [("Images", "*.png *.jpg *.jpeg *.tga"), ("All", "*")]), "secondary").grid(row=3, column=2, sticky="w")
+        for var, text in ((self.g_hid, "Hide the GRUB menu (hold Shift / press Esc to show it)"),
+                          (self.g_osp, "Detect other operating systems (os-prober)"),
+                          (self.g_save, "Remember the last booted entry"),
+                          (self.g_quiet, "Quiet boot (hide kernel messages)")):
+            ttk.Checkbutton(c, text=text, variable=var).pack(anchor="w", pady=2)
+        self.button_row(c, [("Apply GRUB Settings", self.apply_grub, "primary"),
+                            ("Restore Last Backup", lambda: self.run_root("Restore GRUB", [
+                                "if [ -f /etc/default/grub.debos.bak ]; then cp /etc/default/grub.debos.bak /etc/default/grub && update-grub; else fail 'No backup found.'; fi"]))])
+
+        c = self.card(body, "Plymouth Boot Splash", "Create a splash theme from your own image or pick an installed theme.")
+        p = tk.Frame(c, bg=P["surface"])
+        p.pack(anchor="w", fill="x")
+        self.plymouth_theme_name = tk.StringVar(value="debos-custom")
+        self.plymouth_bg_path = tk.StringVar()
+        themes = sorted(os.path.basename(d) for d in glob.glob("/usr/share/plymouth/themes/*") if os.path.isdir(d))
+        self.plymouth_existing = tk.StringVar(value=themes[0] if themes else "(install plymouth-themes)")
+        self.label(p, "Theme name:").grid(row=0, column=0, sticky="w", pady=4)
+        self.entry(p, self.plymouth_theme_name, 24).grid(row=0, column=1, sticky="w", padx=10)
+        self.label(p, "Splash image (PNG):").grid(row=1, column=0, sticky="w", pady=4)
+        self.entry(p, self.plymouth_bg_path, 42).grid(row=1, column=1, sticky="w", padx=10)
+        self.button(p, "Browse…", lambda: self.pick_file(self.plymouth_bg_path, [("PNG", "*.png")]), "secondary").grid(row=1, column=2, sticky="w")
+        self.button(p, "Create & Apply Theme", self.apply_plymouth, "primary").grid(row=2, column=1, sticky="w", padx=10, pady=8)
+        self.label(p, "Installed theme:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Combobox(p, textvariable=self.plymouth_existing, values=themes + ["(install plymouth-themes)"], state="readonly", width=24).grid(row=3, column=1, sticky="w", padx=10)
+        self.button(p, "Apply Theme", self.apply_existing_plymouth, "secondary").grid(row=3, column=2, sticky="w")
+        self.button(p, "Preview (8 s)", lambda: self.run_root("Plymouth preview", [
+            "ensure_pkg plymouth plymouth-x11 2>/dev/null || ensure_pkg plymouth",
+            "plymouthd --debug --debug-file=/tmp/plymouth-debug.log; plymouth --show-splash; sleep 8; plymouth quit"], pause=False), "secondary").grid(row=3, column=3, sticky="w", padx=8)
+
+        c = self.card(body, "Login Screen", "Background images are copied to /usr/share/backgrounds/debos so the login screen can read them.")
+        d = tk.Frame(c, bg=P["surface"])
+        d.pack(anchor="w", fill="x")
+        self.dm_target_var = tk.StringVar(value=self.detect_dm())
+        self.dm_bg = tk.StringVar()
+        self.dm_gtk = tk.StringVar(value="Adwaita")
+        self.dm_ico = tk.StringVar(value="Papirus")
+        self.dm_fnt = tk.StringVar(value="Noto Sans 11")
+        self.shw_usr = tk.BooleanVar(value=True)
+        self.en_au = tk.BooleanVar(value=False)
+        users = self.get_users()
+        self.au_var = tk.StringVar(value=self.user if self.user in users else (users[0] if users else ""))
+        fields = [
+            ("Display manager:", lambda p: ttk.Combobox(p, textvariable=self.dm_target_var, values=["GDM3", "LightDM GTK", "Slick-Greeter", "SDDM"], state="readonly", width=22)),
+            ("Background image:", lambda p: self.entry(p, self.dm_bg, 42)),
+            ("GTK theme (LightDM/GDM):", lambda p: self.entry(p, self.dm_gtk, 24)),
+            ("Icon theme:", lambda p: self.entry(p, self.dm_ico, 24)),
+            ("Font:", lambda p: self.entry(p, self.dm_fnt, 24)),
+            ("Autologin user:", lambda p: ttk.Combobox(p, textvariable=self.au_var, values=users, state="readonly", width=22)),
+        ]
+        for i, (lbl, mk) in enumerate(fields):
+            self.label(d, lbl).grid(row=i, column=0, sticky="w", pady=4)
+            mk(d).grid(row=i, column=1, sticky="w", padx=10)
+        self.button(d, "Browse…", lambda: self.pick_file(self.dm_bg, [("Images", "*.png *.jpg *.jpeg"), ("All", "*")]), "secondary").grid(row=1, column=2, sticky="w")
+        ttk.Checkbutton(c, text="Show the user list", variable=self.shw_usr).pack(anchor="w", pady=2)
+        ttk.Checkbutton(c, text="Enable automatic login", variable=self.en_au).pack(anchor="w", pady=2)
+        self.button_row(c, [("Apply Login Settings", self.apply_dm, "primary"), ("Install & Switch Display Manager", self.switch_dm, "danger")])
+
+    def pick_file(self, var, types):
+        path = filedialog.askopenfilename(initialdir=os.path.join(self.home, "Pictures") if os.path.isdir(os.path.join(self.home, "Pictures")) else self.home, filetypes=types)
+        if path:
+            var.set(path)
+
+    def detect_dm(self):
+        target = os.path.basename(os.path.realpath("/etc/systemd/system/display-manager.service"))
+        return {"gdm.service": "GDM3", "gdm3.service": "GDM3", "sddm.service": "SDDM"}.get(
+            target, "Slick-Greeter" if os.path.exists("/usr/sbin/slick-greeter") and target == "lightdm.service" else "LightDM GTK")
+
+    def get_users(self):
+        users = []
+        try:
+            for entry in pwd.getpwall():
+                if 1000 <= entry.pw_uid < 60000 and entry.pw_shell not in ("/usr/sbin/nologin", "/bin/false"):
+                    users.append(entry.pw_name)
+        except Exception:
+            pass
+        return users
+
+    def apply_grub(self):
+        to = self.g_to.get().strip()
+        if not to.isdigit():
+            return messagebox.showerror(APP_NAME, "Timeout must be a whole number of seconds.")
+        color_re = r"^[a-z-]+/[a-z-]+$"
+        if not re.match(color_re, self.grub_color_normal.get()) or not re.match(color_re, self.grub_color_highlight.get()):
+            return messagebox.showerror(APP_NAME, "Colors must look like 'white/black'.")
+
+        def set_key(key, value):
+            return (f"if grep -qE '^#?{key}=' /etc/default/grub; then sed -i -E 's|^#?{key}=.*|{key}={value}|' /etc/default/grub; "
+                    f"else echo '{key}={value}' >> /etc/default/grub; fi")
+        cmds = ["cp /etc/default/grub /etc/default/grub.debos.bak && ok 'Backup: /etc/default/grub.debos.bak'",
+                set_key("GRUB_TIMEOUT", to),
+                set_key("GRUB_TIMEOUT_STYLE", "hidden" if self.g_hid.get() else "menu"),
+                set_key("GRUB_DISABLE_OS_PROBER", "false" if self.g_osp.get() else "true"),
+                set_key("GRUB_COLOR_NORMAL", f'"{self.grub_color_normal.get()}"'),
+                set_key("GRUB_COLOR_HIGHLIGHT", f'"{self.grub_color_highlight.get()}"')]
+        if self.g_osp.get():
+            cmds.append("ensure_pkg os-prober")
+        if self.g_save.get():
+            cmds += [set_key("GRUB_DEFAULT", "saved"), set_key("GRUB_SAVEDEFAULT", "true")]
+        else:
+            cmds += [set_key("GRUB_DEFAULT", "0"), "sed -i '/^GRUB_SAVEDEFAULT=/d' /etc/default/grub"]
+        if self.g_quiet.get():
+            cmds.append("grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=.*quiet' /etc/default/grub || sed -i -E 's/^(GRUB_CMDLINE_LINUX_DEFAULT=\")/\\1quiet /' /etc/default/grub")
+        else:
+            cmds.append("sed -i -E '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/(\\\"| )quiet( |\\\")/\\1\\2/' /etc/default/grub")
+        bg = self.g_bg.get().strip()
+        if bg and bg.startswith("/boot/grub/"):
+            pass  # already configured
+        elif bg:
+            if not os.path.isfile(bg):
+                return messagebox.showerror(APP_NAME, f"Background image not found:\n{bg}")
+            ext = os.path.splitext(bg)[1].lower().lstrip(".")
+            if ext == "jpeg":
+                ext = "jpg"
+            if ext not in ("png", "jpg", "tga"):
+                return messagebox.showerror(APP_NAME, "GRUB supports PNG, JPG and TGA images.")
+            cmds += [f"cp {shlex.quote(bg)} /boot/grub/debos-background.{ext}", set_key("GRUB_BACKGROUND", f'"/boot/grub/debos-background.{ext}"')]
+        else:
+            cmds.append("sed -i '/^GRUB_BACKGROUND=/d' /etc/default/grub")
+        cmds += ["step 'Regenerating GRUB configuration'", "update-grub"]
+        self.run_root("GRUB settings", cmds)
+
+    PLYMOUTH_SCRIPT = r'''wallpaper_image = Image("background.png");
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+wallpaper_sprite = Sprite(wallpaper_image.Scale(screen_width, screen_height));
+wallpaper_sprite.SetZ(-100);
+message_sprite = Sprite();
+message_sprite.SetPosition(screen_width * 0.1, screen_height * 0.85, 10000);
+fun password_callback(prompt, bullets) {
+    text = prompt + "  ";
+    for (i = 0; i < bullets; i++) text = text + "*";
+    message_sprite.SetImage(Image.Text(text, 1, 1, 1));
+}
+Plymouth.SetDisplayPasswordFunction(password_callback);
+fun question_callback(prompt, entry) {
+    message_sprite.SetImage(Image.Text(prompt + "  " + entry, 1, 1, 1));
+}
+Plymouth.SetDisplayQuestionFunction(question_callback);
+fun normal_callback() {
+    message_sprite.SetImage(Image.Text("", 1, 1, 1));
+}
+Plymouth.SetDisplayNormalFunction(normal_callback);
+fun message_callback(text) {
+    message_sprite.SetImage(Image.Text(text, 1, 1, 1));
+}
+Plymouth.SetMessageFunction(message_callback);
+'''
+
+    def plymouth_finish_cmds(self, theme):
+        return [
+            f"plymouth-set-default-theme {theme}",
+            "if [ -f /etc/default/grub ] && ! grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=.*splash' /etc/default/grub; then "
+            "cp /etc/default/grub /etc/default/grub.debos.bak; sed -i -E 's/^(GRUB_CMDLINE_LINUX_DEFAULT=\")/\\1splash /' /etc/default/grub; update-grub; fi",
+            "step 'Rebuilding initramfs'", "update-initramfs -u",
+            f"ok 'Plymouth theme {theme} is active. Reboot to see it.'"]
+
+    def apply_plymouth(self):
+        bg = self.plymouth_bg_path.get().strip()
+        if not bg or not os.path.isfile(bg) or not bg.lower().endswith(".png"):
+            return messagebox.showwarning(APP_NAME, "Please select a valid PNG image.")
+        theme = re.sub(r"[^a-z0-9-]", "", self.plymouth_theme_name.get().strip().lower().replace(" ", "-")) or "debos-custom"
+        d = f"/usr/share/plymouth/themes/{theme}"
+        plymouth_file = "\\n".join(["[Plymouth Theme]", f"Name={theme}", "Description=Custom splash created by Debos - Toolbox",
+                                    "ModuleName=script", "", "[script]", f"ImageDir={d}", f"ScriptFile={d}/{theme}.script"])
+        cmds = [
+            "step 'Installing Plymouth'", "apt_install plymouth plymouth-themes",
+            f"rm -rf {d} && mkdir -p {d}",
+            f"cp {shlex.quote(bg)} {d}/background.png && chmod 644 {d}/background.png",
+            f"printf '{plymouth_file}\\n' > {d}/{theme}.plymouth",
+            f"cat > {d}/{theme}.script <<'DEBOS_EOF'\n{self.PLYMOUTH_SCRIPT}DEBOS_EOF",
+        ] + self.plymouth_finish_cmds(theme)
+        self.run_root("Plymouth theme", cmds)
+
+    def apply_existing_plymouth(self):
+        theme = self.plymouth_existing.get()
+        if theme.startswith("("):
+            return self.run_root("Plymouth themes", ["apt_install plymouth plymouth-themes", "plymouth-set-default-theme -l"])
+        if not re.match(r"^[A-Za-z0-9_.-]+$", theme or ""):
+            return messagebox.showwarning(APP_NAME, "Select a theme.")
+        self.run_root("Plymouth theme", ["ensure_pkg plymouth"] + self.plymouth_finish_cmds(theme))
+
+    def switch_dm(self):
+        dm = self.dm_target_var.get()
+        pkg_map = {"GDM3": ("gdm3", "gdm3", "gdm"), "LightDM GTK": ("lightdm lightdm-gtk-greeter", "lightdm", "lightdm"),
+                   "Slick-Greeter": ("lightdm slick-greeter", "lightdm", "lightdm"), "SDDM": ("sddm", "sddm", "sddm")}
+        if dm not in pkg_map:
+            return messagebox.showwarning(APP_NAME, "Please select a display manager.")
+        pkgs, debconf_name, unit = pkg_map[dm]
+        cmds = [
+            f"step {shlex.quote('Installing ' + dm)}",
+            f"echo '{debconf_name} shared/default-x-display-manager select {debconf_name}' | debconf-set-selections",
+            f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkgs}",
+            f"BIN=$(command -v {debconf_name} || echo /usr/sbin/{debconf_name})",
+            "echo \"$BIN\" > /etc/X11/default-display-manager",
+            f"DEBIAN_FRONTEND=noninteractive dpkg-reconfigure {debconf_name}",
+            f"UNIT=$(systemctl cat {unit}.service >/dev/null 2>&1 && echo {unit}.service || echo {debconf_name}.service)",
+            "ln -sf \"/lib/systemd/system/$UNIT\" /etc/systemd/system/display-manager.service",
+            "systemctl daemon-reload",
+        ]
+        if dm == "Slick-Greeter":
+            cmds += ["mkdir -p /etc/lightdm/lightdm.conf.d",
+                     "printf '[Seat:*]\\ngreeter-session=slick-greeter\\n' > /etc/lightdm/lightdm.conf.d/40-debos-greeter.conf"]
+        elif dm == "LightDM GTK":
+            cmds += ["mkdir -p /etc/lightdm/lightdm.conf.d",
+                     "printf '[Seat:*]\\ngreeter-session=lightdm-gtk-greeter\\n' > /etc/lightdm/lightdm.conf.d/40-debos-greeter.conf"]
+        cmds += [f"ok {shlex.quote(dm + ' is now the default display manager. Reboot to use it.')}"]
+        self.run_root(f"Switch to {dm}", cmds, confirm=f"Install {dm} and make it the default login screen?\nYou will need to reboot afterwards.")
+
+    def apply_dm(self):
+        dm = self.dm_target_var.get()
+        if not dm:
+            return messagebox.showwarning(APP_NAME, "Please select a display manager.")
+        user = self.au_var.get()
+        autologin = self.en_au.get() and bool(user)
+        if user and not re.match(r"^[a-z_][a-z0-9_.-]*\$?$", user):
+            return messagebox.showerror(APP_NAME, "Invalid user name.")
+        gtk_theme, icon, font = self.dm_gtk.get().strip(), self.dm_ico.get().strip(), self.dm_fnt.get().strip()
+        for val in (gtk_theme, icon, font):
+            if not re.match(r"^[A-Za-z0-9 _.+-]*$", val):
+                return messagebox.showerror(APP_NAME, f"Invalid value: {val}")
+        cmds = []
+        bg_target = ""
+        bg = self.dm_bg.get().strip()
+        if bg:
+            if not os.path.isfile(bg):
+                return messagebox.showerror(APP_NAME, f"Image not found:\n{bg}")
+            ext = os.path.splitext(bg)[1].lower() or ".png"
+            bg_target = f"/usr/share/backgrounds/debos/login{ext}"
+            cmds += ["mkdir -p /usr/share/backgrounds/debos", f"install -m 0644 {shlex.quote(bg)} {bg_target}"]
+        show = "true" if self.shw_usr.get() else "false"
+        hide = "false" if self.shw_usr.get() else "true"
+
+        if dm == "GDM3":
+            conf = ["[org/gnome/login-screen]", f"disable-user-list={hide}", "", "[org/gnome/desktop/interface]"]
+            if gtk_theme:
+                conf.append(f"gtk-theme='{gtk_theme}'")
+            if icon:
+                conf.append(f"icon-theme='{icon}'")
+            if font:
+                conf.append(f"font-name='{font}'")
+            if bg_target:
+                conf += ["", "[org/gnome/desktop/background]", f"picture-uri='file://{bg_target}'", f"picture-uri-dark='file://{bg_target}'"]
+            cmds += ["mkdir -p /etc/dconf/db/gdm.d /etc/dconf/profile",
+                     "[ -f /etc/dconf/profile/gdm ] || printf 'user-db:user\\nsystem-db:gdm\\nfile-db:/usr/share/gdm/greeter-dconf-defaults\\n' > /etc/dconf/profile/gdm",
+                     f"printf '%s\\n' {' '.join(shlex.quote(l) for l in conf)} > /etc/dconf/db/gdm.d/90-debos",
+                     "dconf update",
+                     "CONF=/etc/gdm3/daemon.conf; [ -f \"$CONF\" ] || CONF=/etc/gdm3/custom.conf",
+                     "grep -q '^\\[daemon\\]' \"$CONF\" || echo '[daemon]' >> \"$CONF\"",
+                     "sed -i -E '/^#?\\s*AutomaticLogin(Enable)?\\s*=/d' \"$CONF\""]
+            if autologin:
+                cmds.append(f"sed -i '/^\\[daemon\\]/a AutomaticLoginEnable=true\\nAutomaticLogin={user}' \"$CONF\"")
+            if bg_target:
+                cmds.append("warn 'Recent GNOME versions ignore custom login backgrounds; theme, icons and user list still apply.'")
+        elif dm in ("LightDM GTK", "Slick-Greeter"):
+            seat = ["[Seat:*]", f"greeter-hide-users={hide}"]
+            if autologin:
+                seat += [f"autologin-user={user}", "autologin-user-timeout=0"]
+            cmds += ["mkdir -p /etc/lightdm/lightdm.conf.d",
+                     f"printf '%s\\n' {' '.join(shlex.quote(l) for l in seat)} > /etc/lightdm/lightdm.conf.d/50-debos.conf"]
+            if autologin:
+                cmds.append("getent group autologin >/dev/null || groupadd -r autologin; " f"gpasswd -a {user} autologin")
+            if dm == "LightDM GTK":
+                greeter = ["[greeter]", f"theme-name={gtk_theme}", f"icon-theme-name={icon}", f"font-name={font}"]
+                if bg_target:
+                    greeter.append(f"background={bg_target}")
+                cmds += ["mkdir -p /etc/lightdm/lightdm-gtk-greeter.conf.d",
+                         f"printf '%s\\n' {' '.join(shlex.quote(l) for l in greeter)} > /etc/lightdm/lightdm-gtk-greeter.conf.d/50-debos.conf"]
+            else:
+                keys = {"theme-name": gtk_theme, "icon-theme-name": icon, "font-name": font}
+                if bg_target:
+                    keys["background"] = bg_target
+                cmds += ["CONF=/etc/lightdm/slick-greeter.conf", "touch \"$CONF\"", "cp -n \"$CONF\" \"$CONF.debos.bak\" || true",
+                         "grep -q '^\\[Greeter\\]' \"$CONF\" || echo '[Greeter]' >> \"$CONF\""]
+                for k, val in keys.items():
+                    if val:
+                        cmds += [f"sed -i '/^{k}=/d' \"$CONF\"", f"sed -i '/^\\[Greeter\\]/a {k}={val}' \"$CONF\""]
+        elif dm == "SDDM":
+            conf = ["[Theme]", "Current=breeze"]
+            if autologin:
+                conf += ["", "[Autologin]", f"User={user}", "Session=$SESSION"]
+            cmds += ["SESSION=$(for s in plasma plasmawayland plasmax11; do [ -f /usr/share/wayland-sessions/$s.desktop ] || [ -f /usr/share/xsessions/$s.desktop ] && { echo $s; break; }; done)",
+                     "[ -n \"$SESSION\" ] || SESSION=$(basename \"$(ls /usr/share/wayland-sessions/*.desktop /usr/share/xsessions/*.desktop 2>/dev/null | head -n1)\" .desktop)",
+                     "mkdir -p /etc/sddm.conf.d",
+                     # user name is validated above, so an expanding heredoc is safe ($SESSION is filled in by bash)
+                     "cat > /etc/sddm.conf.d/50-debos.conf <<DEBOS_EOF\n" + "\n".join(conf) + "\nDEBOS_EOF"]
+            if bg_target:
+                cmds += ["[ -d /usr/share/sddm/themes/breeze ] && printf '[General]\\nbackground=%s\\n' " f"{bg_target} > /usr/share/sddm/themes/breeze/theme.conf.user || warn 'Breeze SDDM theme not installed.'"]
+            if show == "false":
+                cmds.append("warn 'SDDM has no global option to hide the user list; set it in the SDDM theme instead.'")
+        cmds.append("ok 'Login settings applied. Reboot or restart the display manager to see the changes.'")
+        self.run_root("Login screen", cmds)
+
+    # =======================================================================
+    # About & License
+    # =======================================================================
+    def page_about(self):
+        body, _actions = self.new_page("about")
+        P = self.P
+        c = self.card(body)
+        top = tk.Frame(c, bg=P["surface"])
+        top.pack(fill="x")
+        logo = self.load_image(ICON_PATH, (96, 96))
+        if logo:
+            tk.Label(top, image=logo, bg=P["surface"]).pack(side="left", padx=(0, 18))
+        info = tk.Frame(top, bg=P["surface"])
+        info.pack(side="left", fill="x")
+        self.label(info, APP_NAME, "h1").pack(anchor="w")
+        self.label(info, f"Version {APP_VERSION}  ·  build {APP_BUILD}", "bold", fg=P["accent"]).pack(anchor="w")
+        self.label(info, f"Developer: {AUTHOR}  ·  Timor-Leste", fg=P["muted"]).pack(anchor="w", pady=(4, 0))
+        self.label(info, "All-in-one maintenance, software, driver, kernel, network and customization toolbox\n"
+                         "for Debian Stable, Testing, Sid and LMDE.", fg=P["text"]).pack(anchor="w", pady=(6, 0))
+        self.button_row(c, [
+            ("GitHub Project", lambda: webbrowser.open(APP_URL), "primary"),
+            ("Report an Issue", lambda: webbrowser.open(APP_URL + "/issues")),
+            ("Debian", lambda: webbrowser.open("https://www.debian.org/")),
+            ("FDSL - TL", lambda: webbrowser.open("https://www.fdsl.tl/")),
+            ("Linux Foundation", lambda: webbrowser.open("https://www.linuxfoundation.org/")),
+        ])
+        self.label(c, "Credits: logic inspired by ubuntu-cleaner & iven.in; UI inspired by modern flat utility apps.", "small", fg=P["muted"]).pack(anchor="w", pady=(8, 0))
+
+        c = self.card(body, "Settings")
+        self.autostart_file = os.path.join(self.home, ".config/autostart/debos-toolbox.desktop")
+        self.autostart_var = tk.BooleanVar(value=os.path.exists(self.autostart_file))
+        ttk.Checkbutton(c, text="Background health monitor at login (broken packages, updates, low disk space)", variable=self.autostart_var, command=self.toggle_autostart).pack(anchor="w", pady=2)
+        self.label(c, f"Settings file: {CONFIG_FILE}\nAction log: {LOG_FILE}", "small", fg=P["muted"]).pack(anchor="w", pady=(6, 0))
+
+        c = self.card(body, "Send Feedback & Suggestions", "Opens your e-mail client with the message pre-filled.")
+        f = tk.Frame(c, bg=P["surface"])
+        f.pack(anchor="w", fill="x")
+        self.fb_name, self.fb_email = tk.StringVar(), tk.StringVar()
+        self.fb_distro = tk.StringVar(value=f"{self.sys['pretty']} [{BRANCH_LABEL.get(self.sys['branch'])}] - Debos {APP_VERSION}")
+        for i, (lbl, var) in enumerate((("Name:", self.fb_name), ("Email:", self.fb_email), ("System:", self.fb_distro))):
+            self.label(f, lbl).grid(row=i, column=0, sticky="w", pady=3)
+            self.entry(f, var, 52).grid(row=i, column=1, sticky="w", padx=10)
+        self.label(f, "Message:").grid(row=3, column=0, sticky="nw", pady=3)
+        self.fb_msg = self.text_box(f, height=5, mono=False)
+        self.fb_msg.configure(width=60)
+        self.fb_msg.grid(row=3, column=1, sticky="w", padx=10, pady=3)
+        self.button(f, "Send via Mail Client", self.send_feedback, "primary").grid(row=4, column=1, sticky="w", padx=10, pady=8)
+
+    def toggle_autostart(self):
+        try:
+            if self.autostart_var.get():
+                os.makedirs(os.path.dirname(self.autostart_file), exist_ok=True)
+                with open(self.autostart_file, "w", encoding="utf-8") as fh:
+                    fh.write("[Desktop Entry]\nType=Application\nExec=/usr/bin/debos-toolbox --startup\nHidden=false\nNoDisplay=false\n"
+                             "X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=60\nName=Debos Health Monitor\n"
+                             f"Comment=Checks system health at login\nIcon={ICON_PATH}\n")
+            elif os.path.exists(self.autostart_file):
+                os.remove(self.autostart_file)
+            self.set_status("Health monitor " + ("enabled" if self.autostart_var.get() else "disabled"))
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Could not change autostart: {exc}")
+
+    def send_feedback(self):
+        name = self.fb_name.get().strip()
+        msg = self.fb_msg.get("1.0", "end").strip()
+        if not msg or not name:
+            return messagebox.showwarning(APP_NAME, "Name and message are required.")
+        body = urllib.parse.quote(f"Name: {name}\nEmail: {self.fb_email.get().strip()}\nSystem: {self.fb_distro.get().strip()}\n\nFeedback:\n{msg}")
+        subject = urllib.parse.quote(f"Feedback for {APP_NAME} {APP_VERSION}")
+        webbrowser.open(f"mailto:{AUTHOR_MAIL}?subject={subject}&body={body}")
+
+    def page_license(self):
+        body, _actions = self.new_page("license")
+        P = self.P
+        c = self.card(body)
+        txt = f"""{APP_NAME} v{APP_VERSION}
+Copyright (c) 2026 {AUTHOR}.
+
+This application is Open Source Software. You are free to modify, distribute, and enhance it,
+provided that the original author ({AUTHOR}) is explicitly credited in all derivative works.
+The full license text is distributed with the source code (GNU GPL v3).
+
+• Linux® is the registered trademark of Linus Torvalds.
+• Debian is a registered trademark of Software in the Public Interest, Inc.
+• FDSL - TL (Free and Open Source Software Timor-Leste).
+• GNU Software / GNU/Linux are trademarks of the Free Software Foundation.
+• Third-party software installed by this tool is provided by its respective vendors under their own licenses.
+
+AI ASSISTANCE DISCLOSURE:
+This software was developed with the assistance of AI tools (Google Gemini, Microsoft Copilot and Anthropic Claude).
+Code generated by these AI models is subject to their respective Terms of Service and open-source compliance policies.
+AI-generated content is provided "AS-IS" without express or implied warranties. The author and the aforementioned AI
+providers hold no liability for any potential system instability resulting from the use of this software.
+Always keep backups of your data."""
+        t = self.text_box(c, height=20, mono=False)
+        t.insert("1.0", txt)
+        t.config(state="disabled", wrap="word")
+        t.pack(fill="x")
+        c = self.card(body, "Support the Developer")
+        img = self.load_image(PAYPAL_IMG, (150, 85))
+        if img:
+            tk.Button(c, image=img, bd=0, bg=P["surface"], activebackground=P["surface"], cursor="hand2", highlightthickness=0,
+                      command=lambda: webbrowser.open(PAYPAL_URL)).pack(anchor="w")
+        else:
+            self.button(c, "Donate via PayPal", lambda: webbrowser.open(PAYPAL_URL), "primary").pack(anchor="w")
+
+
+def main():
+    args = sys.argv[1:]
+    if "--version" in args or "-v" in args:
+        print(f"{APP_NAME} {APP_VERSION} (build {APP_BUILD})")
+        return 0
+    if "--help" in args or "-h" in args:
+        print(f"{APP_NAME} {APP_VERSION}\n\nUsage: debos-toolbox [--startup | --version | --help]\n\n"
+              "  --startup   run the background health check (used by autostart) and exit\n"
+              "  --version   print the version and exit")
+        return 0
+    if "--startup" in args:
+        startup_health_check()
+        return 0
+    if tk is None:
+        print(f"{APP_NAME}: Tkinter is missing. Install it with: sudo apt install python3-tk", file=sys.stderr)
+        return 1
+    try:
+        root = tk.Tk(className="debos-toolbox")
+    except tk.TclError as exc:
+        print(f"{APP_NAME}: cannot open a display ({exc}).", file=sys.stderr)
+        return 1
+    DebosToolbox(root)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

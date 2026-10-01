@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Debos - Toolbox
+GenericName=System Toolbox
+Comment=Clean, repair, update and customize Debian: software, drivers, kernels, network and more
+Exec=/usr/bin/debos-toolbox
+Icon=/usr/share/pixmaps/debos-toolbox.png
+Terminal=false
+Categories=System;PackageManager;
+Keywords=debian;cleaner;kernel;driver;software;sources;apt;upgrade;sid;testing;
+StartupWMClass=debos-toolbox
+StartupNotify=true

@@ -1,0 +1,22 @@
+debos-toolbox (0.5.0) unstable; urgency=medium
+
+  * Complete redesign: sidebar navigation, dashboard, cards, light/dark theme.
+  * English is the default language; language and theme are remembered.
+  * Support for Debian Stable (trixie), Oldstable (bookworm), Testing (forky)
+    and Sid; branch detection and a Stable/Testing/Sid switcher (deb822).
+  * New pages: Dashboard, Updates & Release, Tweaks & Tools.
+  * Fixed crash on Python 3.11 (Debian 12) caused by an f-string syntax error.
+  * Fixed crashes when installing/removing desktop environments and WMs.
+  * Fixed software recipes that used non-existent package names.
+  * Fixed repo repair corrupting deb822 .sources files; removed weak-signature
+    override; XanMod repository codename was never expanded.
+  * Rewritten Plymouth, login screen, uninstall and network tools.
+  * All scripts are logged to /var/log/debos-toolbox.log.
+
+ -- Hugo Moniz do Rego <hugomonizdorego@gmail.com>  Thu, 01 Oct 2026 12:00:00 +0700
+
+debos-toolbox (0.4.29.1) unstable; urgency=medium
+
+  * Previous release.
+
+ -- Hugo Moniz do Rego <hugomonizdorego@gmail.com>  Sun, 05 Apr 2026 10:05:00 +0900
