@@ -1,0 +1,84 @@
+#!/bin/bash
+# debos-launch MODE SCRIPT STATUS [PAUSE]
+#
+# Runs a Debos - Toolbox task script inside the embedded console (or an
+# external terminal) and writes its exit code to STATUS.  MODE is "root" or
+# "user".  For root tasks the privilege method is chosen automatically:
+# pkexec (graphical or text polkit agent) -> sudo -> su.  DEBOS_PRIV can force
+# one of: auto, pkexec, sudo, su.
+
+mode="$1"
+script="$2"
+status="$3"
+pause="${4:-0}"
+libdir="$(dirname "$(readlink -f "$0")")"
+runner="$libdir/debos-root"
+method="${DEBOS_PRIV:-auto}"
+
+finish() {
+    local rc="$1"
+    echo "$rc" > "$status.tmp" && mv -f "$status.tmp" "$status"
+    rm -f "$script"
+    if [ "$pause" = 1 ]; then
+        echo
+        read -rp "Press Enter to close this window..." _
+    fi
+    exit "$rc"
+}
+
+trap 'finish 130' INT TERM HUP
+
+if [ ! -f "$script" ]; then
+    echo "debos-launch: task script $script not found" >&2
+    finish 2
+fi
+
+if [ "$mode" = user ] || [ "$(id -u)" -eq 0 ]; then
+    if [ "$mode" = root ]; then
+        DEBOS_UID="$(id -u)" bash "$runner" "$script"
+    else
+        bash "$script"
+    fi
+    finish $?
+fi
+
+in_admin_group() {
+    id -nG 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|admin|wheel'
+}
+
+try_pkexec() {
+    command -v pkexec >/dev/null 2>&1 || return 127
+    pkexec "$runner" "$script"
+}
+
+try_sudo() {
+    command -v sudo >/dev/null 2>&1 || return 127
+    echo "Administrator password (sudo) for $(id -un):"
+    sudo bash "$runner" "$script"
+}
+
+try_su() {
+    command -v su >/dev/null 2>&1 || return 127
+    echo "Enter the root password:"
+    su -c "DEBOS_UID=$(id -u) bash $(printf '%q' "$runner") $(printf '%q' "$script")" root
+}
+
+rc=127
+case "$method" in
+    pkexec) try_pkexec; rc=$? ;;
+    sudo) try_sudo; rc=$? ;;
+    su) try_su; rc=$? ;;
+    *)
+        try_pkexec; rc=$?
+        if [ "$rc" -eq 127 ]; then
+            # pkexec missing or no authentication agent: fall back
+            if in_admin_group; then try_sudo; rc=$?; else try_su; rc=$?; fi
+        fi
+        ;;
+esac
+
+case "$rc" in
+    126) echo; echo "Authentication was cancelled or denied." ;;
+    127) echo; echo "Could not obtain administrator rights (no pkexec, sudo or su available)." ;;
+esac
+finish "$rc"

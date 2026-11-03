@@ -1,0 +1,12 @@
+"""Debos - Toolbox: the all-in-one GTK toolbox for Debian Stable, Testing, Sid and LMDE."""
+
+APP_NAME = "Debos - Toolbox"
+APP_ID = "io.github.hugomonizdorego.DebosToolbox"
+APP_SLUG = "debos-toolbox"
+VERSION = "0.6.0"
+BUILD = "20261103"
+AUTHOR = "Hugo Moniz do Rego"
+AUTHOR_MAIL = "hugomonizdorego@gmail.com"
+HOMEPAGE = "https://github.com/hugomonizdorego/Debos---Toolbox"
+ISSUES = HOMEPAGE + "/issues"
+DONATE = "https://www.paypal.com/paypalme/hugocenturion0311"

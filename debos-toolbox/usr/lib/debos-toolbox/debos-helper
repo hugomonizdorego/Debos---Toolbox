@@ -1,0 +1,120 @@
+#!/usr/bin/python3 -I
+"""debos-helper: root-side repairs for Debos - Toolbox task scripts.
+
+Usage (inside a task script, as root):
+  debos-helper enable-components contrib non-free non-free-firmware
+  debos-helper set-component COMPONENT on|off
+  debos-helper doctor [--no-fix] [--no-update] [--keep-dead]
+  debos-helper dedupe
+  debos-helper migrate-keys
+  debos-helper write-official            (deb822 text on stdin)
+  debos-helper set-extra NAME on|off     (deb822 text on stdin when on)
+  debos-helper set-entry FILE INDEX enable|disable|remove
+  debos-helper repair-key FILE INDEX [KEYID]
+  debos-helper key-import NAME URL
+  debos-helper key-import-id NAME KEYID
+  debos-helper key-remove PATH
+  debos-helper remove-kernel-files VERSION...
+"""
+
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from debos.core import doctor, sources  # noqa: E402
+
+
+def need_root():
+    if os.geteuid() != 0:
+        print("debos-helper must run as root", file=sys.stderr)
+        sys.exit(2)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, args = argv[0], argv[1:]
+    need_root()
+    if cmd == "enable-components":
+        return 0 if doctor.enable_components(args or ["contrib", "non-free", "non-free-firmware"]) else 1
+    if cmd == "set-component" and len(args) == 2:
+        return 0 if doctor.set_component(args[0], args[1] == "on") else 1
+    if cmd == "doctor":
+        ok = doctor.doctor(fix="--no-fix" not in args, update="--no-update" not in args,
+                           disable_dead="--keep-dead" not in args)
+        return 0 if ok else 1
+    if cmd == "dedupe":
+        doctor.backup(sources.source_files(), "dedupe")
+        doctor.dedupe(sources.parse_all())
+        return 0
+    if cmd == "migrate-keys":
+        return 0 if doctor.migrate_legacy_keyring() else 1
+    if cmd == "write-official":
+        text = sys.stdin.read()
+        if "Types:" not in text or "URIs:" not in text:
+            print("write-official: no deb822 text on stdin", file=sys.stderr)
+            return 1
+        return 0 if doctor.write_official(text) else 1
+    if cmd == "set-extra" and len(args) == 2:
+        name = args[0]
+        if not re.match(r"^debos-[a-z0-9-]+$", name):
+            print("set-extra: invalid name", file=sys.stderr)
+            return 1
+        text = sys.stdin.read() if args[1] == "on" else None
+        return 0 if doctor.set_extra_repo(name, args[1] == "on", text) else 1
+    if cmd == "set-entry" and len(args) == 3:
+        return 0 if doctor.set_entry(args[0], int(args[1]), args[2]) else 1
+    if cmd == "repair-key" and len(args) >= 2:
+        for e in sources.parse_file(args[0]):
+            if e.index == int(args[1]):
+                return 0 if doctor.repair_entry_key(e, keyid=args[2] if len(args) > 2 else None) else 1
+        print("repair-key: entry not found", file=sys.stderr)
+        return 1
+    if cmd == "key-import" and len(args) == 2:
+        name, url = args
+        if not re.match(r"^[a-z0-9][a-z0-9.-]*$", name) or not url.startswith("https://"):
+            print("key-import: invalid name or URL (https only)", file=sys.stderr)
+            return 1
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dl = os.path.join(tmp, "key")
+            if not doctor._download(url, dl):
+                print(f"could not download {url}", file=sys.stderr)
+                return 1
+            dest = os.path.join(doctor.KEYRING_DIR, name + ".gpg")
+            ok = doctor.install_keyring(dest, [dl])
+            print(f"{'Saved' if ok else 'Failed to save'} {dest}")
+            return 0 if ok else 1
+    if cmd == "key-import-id" and len(args) == 2:
+        name, keyid = args
+        if not re.match(r"^[a-z0-9][a-z0-9.-]*$", name) or not re.match(r"^[0-9A-Fa-f]{8,40}$", keyid):
+            print("key-import-id: invalid arguments", file=sys.stderr)
+            return 1
+        dest = os.path.join(doctor.KEYRING_DIR, name + ".gpg")
+        ok = doctor.fetch_key_from_keyservers(keyid.upper(), dest)
+        print(f"{'Saved' if ok else 'Failed to fetch'} {dest}")
+        return 0 if ok else 1
+    if cmd == "key-remove" and len(args) == 1:
+        path = os.path.realpath(args[0])
+        if not path.startswith(("/etc/apt/keyrings/", "/etc/apt/trusted.gpg.d/")):
+            print("key-remove: only keys in /etc/apt/keyrings or /etc/apt/trusted.gpg.d can be removed", file=sys.stderr)
+            return 1
+        used = [e for e in sources.parse_all() if e.enabled and os.path.realpath(e.signed_by or "/nonexistent") == path]
+        if used:
+            print("key-remove: key is still used by: " + ", ".join(e.label() for e in used), file=sys.stderr)
+            return 1
+        doctor.backup([path], "key")
+        os.remove(path)
+        print(f"Removed {path} (backup in {doctor.BACKUP_ROOT})")
+        return 0
+    if cmd == "remove-kernel-files" and args:
+        return 0 if doctor.remove_kernel_files(args) else 1
+    print(f"debos-helper: unknown command or wrong arguments: {' '.join(argv)}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

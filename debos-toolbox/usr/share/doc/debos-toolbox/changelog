@@ -1,3 +1,61 @@
+debos-toolbox (0.6.0) unstable; urgency=medium
+
+  * Rebuilt from scratch in Python 3 + GTK 4 (PyGObject) - the native Debian
+    desktop toolkit, as used by GNOME Tweaks, Ubuntu Cleaner and Ubuntu Tweak.
+  * New design combining soft neumorphic cards, a profile sidebar, colourful
+    dashboard tiles, a launcher-style app grid with search and keyboard hints,
+    blue gradient buttons, light and dark themes.
+  * Embedded task console (VTE) with a queue; tasks run as readable scripts,
+    per-step status, Ctrl+C stop, external-terminal fallback.
+  * Administrator rights through pkexec (polkit action with auth_admin_keep),
+    sudo or su - works when the user is not in the sudo group (Debian default
+    when a root password is set).
+  * New: Recommendations engine with health score and "Fix all (safe)".
+  * Cleaner rewritten (Scan/refresh + Clean): APT cache, unneeded packages,
+    old kernels, leftover kernel module folders, package configs, journal,
+    rotated logs, crash dumps, /var/tmp, kernel build trees (never while a
+    build runs), Flatpak runtimes and caches, thumbnails, Trash, recent
+    files, developer caches and browser caches.
+  * Kernels: fixed the kernel.org build. Task scripts exported ARCH=amd64,
+    which made Kbuild look for arch/amd64 and fail at once (it also broke
+    DKMS module builds); ARCH is no longer exported. fakeroot is installed,
+    x.y releases (6.12 builds as 6.12.0) are found after the build, every
+    build gets its own package revision, localmodconfig no longer fails
+    under pipefail, plus disk-space and signature checks, debug info and BTF
+    off, bindeb-pkg .deb packages, Ctrl+C stops the build. Kernels installed
+    outside APT (made by "make install" in Debos 0.4) are now detected and
+    can be removed; XanMod via deb822, Liquorix via extrepo, Debian RT and
+    backports kernels.
+  * Tasks whose steps depend on each other (kernel builds, vendor
+    repositories, login manager switch) stop at the first failed step.
+  * Repository Doctor: understands APT 3 (trixie and later) and the sqv
+    verifier, whose messages the old version did not recognise; duplicate
+    entries are merged without losing components and conflicting Signed-By
+    values are aligned; missing keys that are already on the system are
+    reused, Debian keyrings are restored, then vendor keys and keyservers;
+    expired keys are refreshed; legacy trusted.gpg migration; CD/DVD
+    entries, dead repositories, wrong architectures and
+    --allow-releaseinfo-change after a Debian release. A repository whose
+    key was just repaired is no longer disabled as "dead".
+  * Repositories page: components, backports, Debian Fasttrack, experimental,
+    mirrors, extrepo third-party repositories, other sources and GPG keys.
+  * Software Center: 130+ apps; Debian package first, then extrepo vendor
+    repositories, vendor repository/.deb, then Flathub; search all Debian
+    packages and Flathub.
+  * Desktops & WMs: installed (checkmark) and current session detection;
+    Debian-packaged DEs, 25 window managers (Sway, Hyprland, labwc, Wayfire,
+    river, niri, i3, bspwm, xmonad, dwm, ...) and 11 login managers
+    (greetd, Ly, LXDM, XDM, nodm, Arctica, ...), filtered by availability.
+  * Drivers: sysfs-based detection with vendor/device IDs and the kernel driver
+    in use; NVIDIA via nvidia-detect with Secure Boot MOK enrollment, AMD,
+    Intel, Wi-Fi firmware per vendor, SOF audio, microcode, VM guest tools,
+    isenkram suggestions.
+  * Desktop Tweaks, Startup Apps, Default Apps, Templates & Scripts and
+    desktop settings backup/restore (ideas from Ubuntu Tweak).
+  * Packaging: polkit policy, AppStream metainfo, hicolor icons, man page.
+
+ -- Hugo Moniz do Rego <hugomonizdorego@gmail.com>  Tue, 03 Nov 2026 12:00:00 +0900
+
 debos-toolbox (0.5.0) unstable; urgency=medium
 
   * Complete redesign: sidebar navigation, dashboard, cards, light/dark theme.

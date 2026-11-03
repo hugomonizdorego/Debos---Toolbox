@@ -13,3 +13,7 @@ License: GPL-3+
  .
  On Debian systems, the complete text of the GNU General Public License
  version 3 can be found in "/usr/share/common-licenses/GPL-3".
+ .
+ Feature ideas for the cleaner and the desktop tweak pages come from
+ Ubuntu Cleaner (Gerard Puig, GPL-3) and Ubuntu Tweak (Tualatrix Chou,
+ GPL-2+); the code was written anew for Debian.

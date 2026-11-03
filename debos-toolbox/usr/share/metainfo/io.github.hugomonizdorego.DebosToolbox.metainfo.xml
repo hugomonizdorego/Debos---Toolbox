@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.hugomonizdorego.DebosToolbox</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Debos - Toolbox</name>
+  <summary>All-in-one toolbox for Debian Stable, Testing and Sid</summary>
+  <developer id="io.github.hugomonizdorego">
+    <name>Hugo Moniz do Rego</name>
+  </developer>
+  <description>
+    <p>Debos - Toolbox keeps a Debian desktop healthy and lets you customize it from one place.</p>
+    <ul>
+      <li>Dashboard with health score and smart recommendations</li>
+      <li>System cleaner: package cache, old kernels, logs, thumbnails, browser caches</li>
+      <li>Updates and switching between Debian Stable, Testing and Sid</li>
+      <li>Repository Doctor for duplicate entries and missing or expired GPG keys, plus extrepo third-party repositories</li>
+      <li>Software center with Debian packages, vendor repositories and Flathub</li>
+      <li>Desktop environments, window managers and login managers packaged in Debian</li>
+      <li>Kernels: XanMod, Liquorix, Linux-libre, backports and builds from kernel.org</li>
+      <li>Hardware detection with driver and firmware recommendations</li>
+      <li>Desktop tweaks, startup applications, default applications and templates</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.hugomonizdorego.DebosToolbox.desktop</launchable>
+  <url type="homepage">https://github.com/hugomonizdorego/Debos---Toolbox</url>
+  <url type="bugtracker">https://github.com/hugomonizdorego/Debos---Toolbox/issues</url>
+  <url type="donation">https://www.paypal.com/paypalme/hugocenturion0311</url>
+  <categories><category>System</category><category>Settings</category></categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.6.0" date="2026-11-03">
+      <description><p>Rebuilt from scratch with GTK 4: new design, embedded console, recommendations, Repository Doctor, extrepo, kernel.org builds as Debian packages, removal of manually installed kernels, sysfs driver detection and desktop tweaks.</p></description>
+    </release>
+    <release version="0.5.0" date="2026-10-01"/>
+  </releases>
+</component>

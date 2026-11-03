@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Debos - Toolbox</vendor>
+  <vendor_url>https://github.com/hugomonizdorego/Debos---Toolbox</vendor_url>
+  <icon_name>debos-toolbox</icon_name>
+  <action id="io.github.hugomonizdorego.debostoolbox.run-task">
+    <description>Run Debos - Toolbox maintenance tasks</description>
+    <description xml:lang="id">Jalankan tugas perawatan Debos - Toolbox</description>
+    <description xml:lang="pt">Executar tarefas de manutenção do Debos - Toolbox</description>
+    <message>Authentication is required to change system settings, install software or repair the system</message>
+    <message xml:lang="id">Autentikasi diperlukan untuk mengubah pengaturan sistem, memasang aplikasi atau memperbaiki sistem</message>
+    <message xml:lang="pt">É necessária autenticação para alterar o sistema, instalar software ou reparar o sistema</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/debos-toolbox/debos-root</annotate>
+  </action>
+</policyconfig>

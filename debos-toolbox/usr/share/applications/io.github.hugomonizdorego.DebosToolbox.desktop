@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=Debos - Toolbox
+GenericName=System Toolbox
+Comment=Clean, repair, update and customize Debian: software, drivers, kernels, repositories and more
+Comment[id]=Bersihkan, perbaiki, perbarui dan kustomisasi Debian: aplikasi, driver, kernel, repositori dan lainnya
+Comment[pt]=Limpe, repare, atualize e personalize o Debian: software, controladores, kernels, repositórios e mais
+Exec=debos-toolbox
+Icon=debos-toolbox
+Terminal=false
+Categories=System;PackageManager;
+Keywords=debian;cleaner;janitor;kernel;driver;nvidia;software;repository;gpg;sources;apt;upgrade;sid;testing;tweak;
+StartupNotify=true
+StartupWMClass=debos-toolbox
+Actions=cleaner;updates;software;
+
+[Desktop Action cleaner]
+Name=Cleaner
+Exec=debos-toolbox --page cleaner
+
+[Desktop Action updates]
+Name=Updates & Release
+Exec=debos-toolbox --page updates
+
+[Desktop Action software]
+Name=Software Center
+Exec=debos-toolbox --page software

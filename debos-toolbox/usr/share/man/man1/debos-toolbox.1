@@ -1,0 +1,33 @@
+.TH DEBOS-TOOLBOX 1 "November 2026" "Debos - Toolbox 0.6.0" "User Commands"
+.SH NAME
+debos-toolbox \- all-in-one GTK toolbox for Debian Stable, Testing, Sid and LMDE
+.SH SYNOPSIS
+.B debos-toolbox
+[\fB\-\-page\fR \fINAME\fR] [\fB\-\-startup\fR] [\fB\-\-version\fR] [\fB\-\-help\fR]
+.SH DESCRIPTION
+Debos - Toolbox cleans, repairs, updates and customizes a Debian system. Every administrative
+action is turned into a readable shell script that runs in the embedded console with
+administrator rights obtained through pkexec, sudo or su. Output is recorded in
+/var/log/debos-toolbox/tasks.log.
+.SH OPTIONS
+.TP
+.BR \-\-page " " \fINAME\fR
+Open a page directly, for example cleaner, updates, repositories, software, kernels or drivers.
+.TP
+.B \-\-startup
+Run the health check used by the login monitor and exit.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH FILES
+.TP
+.I ~/.config/debos-toolbox/settings.json
+User settings.
+.TP
+.I /var/log/debos-toolbox/tasks.log
+Log of all administrative tasks.
+.TP
+.I /var/backups/debos-toolbox/
+Backups of APT sources, keys and other files changed by the program.
+.SH AUTHOR
+Hugo Moniz do Rego <hugomonizdorego@gmail.com>
